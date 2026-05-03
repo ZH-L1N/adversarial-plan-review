@@ -110,7 +110,7 @@ def restore_cumulative_from_sidecars(fixs_dir: Path, slug: str, version: str) ->
     resume flow (§5.9) so cost continuity survives session restarts — a v2
     improvement over v1 which always started cost tracking at 0 on resume.
     """
-    pattern = f"{slug}-{version}-round-*.json"
+    pattern = f"{version}-{slug}-round-*.json"
     sidecars = sorted(
         fixs_dir.glob(pattern),
         key=lambda p: _round_number_from_path(p, slug, version),
@@ -131,7 +131,7 @@ def restore_cumulative_from_sidecars(fixs_dir: Path, slug: str, version: str) ->
 
 def _round_number_from_path(path: Path, slug: str, version: str) -> int:
     """Extract the round number from a sidecar path, for sort ordering."""
-    prefix = f"{slug}-{version}-round-"
+    prefix = f"{version}-{slug}-round-"
     suffix = ".json"
     name = path.name
     if name.startswith(prefix) and name.endswith(suffix):

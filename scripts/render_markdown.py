@@ -40,7 +40,7 @@ def render_header(
     return (
         f"# Fixes log: {slug} {version}\n"
         "\n"
-        f"- Plan: `plans/{slug}-{version}.md`\n"
+        f"- Plan: `plans/{version}-{slug}.md`\n"
         f"- Started: {started_at}\n"
         f"- Reviewer: {_human_transport(transport)} ({model})\n"
         "- Planner: Claude\n"

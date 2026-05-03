@@ -442,7 +442,7 @@ def _load_prior_sidecars(
     """Load round 1..current_round-1 sidecars in numeric order."""
     out: list[dict[str, Any]] = []
     for n in range(1, current_round):
-        path = sidecars_dir / f"{slug}-{version}-round-{n}.json"
+        path = sidecars_dir / f"{version}-{slug}-round-{n}.json"
         if not path.exists():
             print(
                 f"ERROR: missing sidecar {path}; cannot build round {current_round} prompt",

@@ -145,11 +145,11 @@ def _snapshot_dir() -> Path:
 
 
 def _snapshot_path(slug: str, version: str, snapshot_index: int) -> Path:
-    return _snapshot_dir() / f"{slug}-{version}-plan-snapshot-r{snapshot_index}.md"
+    return _snapshot_dir() / f"{version}-{slug}-plan-snapshot-r{snapshot_index}.md"
 
 
 def _sidecar_path(slug: str, version: str, round_n: int) -> Path:
-    return Path("plans/fixs") / f"{slug}-{version}-round-{round_n}.json"
+    return Path("plans/fixs") / f"{version}-{slug}-round-{round_n}.json"
 
 
 def take_initial_snapshot(plan_path: Path, *, slug: str, version: str) -> None:
@@ -319,7 +319,7 @@ def cleanup_snapshots(slug: str, version: str) -> int:
     snapshot_dir = Path(".scratch")
     if not snapshot_dir.is_dir():
         return 0
-    pattern = f"{slug}-{version}-plan-snapshot-r*.md"
+    pattern = f"{version}-{slug}-plan-snapshot-r*.md"
     paths = list(snapshot_dir.glob(pattern))
     for path in paths:
         try:
@@ -443,7 +443,7 @@ def regenerate_fixes_md(
         model=first["model"],
     )
     body = render_markdown.render_full_fixes_md(header, sidecars)
-    target = output_path or Path("plans/fixs") / f"{slug}-{version}-fixes.md"
+    target = output_path or Path("plans/fixs") / f"{version}-{slug}-fixes.md"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(body, encoding="utf-8")
     return target
@@ -463,7 +463,7 @@ def load_sidecars(*, slug: str, version: str) -> list[dict[str, Any]]:
     fixs_dir = Path("plans/fixs")
     if not fixs_dir.is_dir():
         return []
-    pattern = f"{slug}-{version}-round-*.json"
+    pattern = f"{version}-{slug}-round-*.json"
     matches: dict[int, Path] = {}
     for path in fixs_dir.glob(pattern):
         n = _round_number_from_path(path, slug, version)
@@ -476,7 +476,7 @@ def load_sidecars(*, slug: str, version: str) -> list[dict[str, Any]]:
     if missing:
         raise ResumeIntegrityError(
             f"Non-contiguous sidecar range: missing round(s) {missing} "
-            f"in {fixs_dir}/{slug}-{version}-round-*.json"
+            f"in {fixs_dir}/{version}-{slug}-round-*.json"
         )
     out: list[dict[str, Any]] = []
     for n in expected_range:
@@ -485,7 +485,7 @@ def load_sidecars(*, slug: str, version: str) -> list[dict[str, Any]]:
 
 
 def _round_number_from_path(path: Path, slug: str, version: str) -> int | None:
-    prefix = f"{slug}-{version}-round-"
+    prefix = f"{version}-{slug}-round-"
     suffix = ".json"
     name = path.name
     if not name.startswith(prefix) or not name.endswith(suffix):
@@ -903,16 +903,16 @@ def plan_start_over(*, slug: str, version: str) -> StartOverPlan:
     sidecars: list[Path] = []
     if fixs_dir.is_dir():
         sidecars = sorted(
-            fixs_dir.glob(f"{slug}-{version}-round-*.json"),
+            fixs_dir.glob(f"{version}-{slug}-round-*.json"),
             key=lambda p: _round_number_from_path(p, slug, version) or 0,
         )
-    fixes_md = fixs_dir / f"{slug}-{version}-fixes.md"
+    fixes_md = fixs_dir / f"{version}-{slug}-fixes.md"
     fixes_md_present: Path | None = fixes_md if fixes_md.exists() else None
 
     snapshot_dir = Path(".scratch")
     snapshots: list[Path] = []
     if snapshot_dir.is_dir():
-        snapshots = sorted(snapshot_dir.glob(f"{slug}-{version}-plan-snapshot-r*.md"))
+        snapshots = sorted(snapshot_dir.glob(f"{version}-{slug}-plan-snapshot-r*.md"))
 
     return StartOverPlan(
         sidecars=sidecars,
@@ -931,7 +931,7 @@ def execute_start_over(
 
     The caller (SKILL.md) is responsible for capturing user_decision text and
     optionally a summary of the previous run before calling. NEVER deletes
-    `plans/<slug>-<version>.md` — the plan itself is user-authored and out
+    `plans/<version>-<slug>.md` — the plan itself is user-authored and out
     of scope per §5.0.
     """
     deleted: list[str] = []

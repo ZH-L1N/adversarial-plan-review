@@ -129,7 +129,7 @@ def test_restore_cumulative_reads_latest_sidecar(tmp_path):
     fixs.mkdir()
     for n, cost in [(1, 0.10), (2, 0.30), (3, 0.55)]:
         sidecar = {"stats": {"cumulative_cost_usd": cost}}
-        (fixs / f"test-v1-round-{n}.json").write_text(json.dumps(sidecar))
+        (fixs / f"v1-test-round-{n}.json").write_text(json.dumps(sidecar))
     assert restore_cumulative_from_sidecars(fixs, "test", "v1") == 0.55
 
 
@@ -139,7 +139,7 @@ def test_restore_cumulative_picks_highest_round_number(tmp_path):
     fixs.mkdir()
     for n, cost in [(1, 0.05), (10, 1.50), (2, 0.10)]:
         sidecar = {"stats": {"cumulative_cost_usd": cost}}
-        (fixs / f"test-v1-round-{n}.json").write_text(json.dumps(sidecar))
+        (fixs / f"v1-test-round-{n}.json").write_text(json.dumps(sidecar))
     assert restore_cumulative_from_sidecars(fixs, "test", "v1") == 1.50
 
 
@@ -147,7 +147,7 @@ def test_restore_cumulative_handles_missing_field(tmp_path):
     """Sidecar missing cumulative_cost_usd → 0.0, not exception."""
     fixs = tmp_path / "fixs"
     fixs.mkdir()
-    (fixs / "test-v1-round-1.json").write_text(json.dumps({"stats": {}}))
+    (fixs / "v1-test-round-1.json").write_text(json.dumps({"stats": {}}))
     assert restore_cumulative_from_sidecars(fixs, "test", "v1") == 0.0
 
 
@@ -155,5 +155,5 @@ def test_restore_cumulative_handles_corrupt_json(tmp_path):
     """Corrupt JSON → 0.0 (defensive; resume can still proceed)."""
     fixs = tmp_path / "fixs"
     fixs.mkdir()
-    (fixs / "test-v1-round-1.json").write_text("not json")
+    (fixs / "v1-test-round-1.json").write_text("not json")
     assert restore_cumulative_from_sidecars(fixs, "test", "v1") == 0.0

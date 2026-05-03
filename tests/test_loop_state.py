@@ -324,7 +324,7 @@ def test_take_initial_snapshot_writes_r1(isolated_repo):
     plan = isolated_repo / "plans" / "test-v0.md"
     plan.write_text("# baseline plan", encoding="utf-8")
     take_initial_snapshot(plan, slug="test", version="v0")
-    snapshot = isolated_repo / ".scratch" / "test-v0-plan-snapshot-r1.md"
+    snapshot = isolated_repo / ".scratch" / "v0-test-plan-snapshot-r1.md"
     assert snapshot.exists()
     assert snapshot.read_text(encoding="utf-8") == "# baseline plan"
 
@@ -337,8 +337,8 @@ def test_take_initial_snapshot_namespaced_does_not_collide(isolated_repo):
     plan_b.write_text("# B", encoding="utf-8")
     take_initial_snapshot(plan_a, slug="a", version="v0")
     take_initial_snapshot(plan_b, slug="b", version="v0")
-    assert (isolated_repo / ".scratch" / "a-v0-plan-snapshot-r1.md").read_text() == "# A"
-    assert (isolated_repo / ".scratch" / "b-v0-plan-snapshot-r1.md").read_text() == "# B"
+    assert (isolated_repo / ".scratch" / "v0-a-plan-snapshot-r1.md").read_text() == "# A"
+    assert (isolated_repo / ".scratch" / "v0-b-plan-snapshot-r1.md").read_text() == "# B"
 
 
 def test_compute_round_diff_uses_snapshot_when_hash_matches(isolated_repo):
@@ -374,7 +374,7 @@ def test_compute_round_diff_uses_snapshot_when_hash_matches(isolated_repo):
             "severity_histogram": {"high": 0, "medium": 0, "low": 0},
         },
     }
-    (isolated_repo / "plans" / "fixs" / "test-v0-round-1.json").write_text(
+    (isolated_repo / "plans" / "fixs" / "v0-test-round-1.json").write_text(
         json.dumps(sidecar), encoding="utf-8"
     )
 
@@ -412,7 +412,7 @@ def test_compute_round_diff_recovers_from_sidecar_when_snapshot_missing(isolated
             "severity_histogram": {"high": 0, "medium": 0, "low": 0},
         },
     }
-    (isolated_repo / "plans" / "fixs" / "test-v0-round-1.json").write_text(
+    (isolated_repo / "plans" / "fixs" / "v0-test-round-1.json").write_text(
         json.dumps(sidecar), encoding="utf-8"
     )
 
@@ -435,7 +435,7 @@ def test_compute_round_diff_branch3_recovers_when_snapshot_mismatched(isolated_r
 
     # Write a CORRUPT snapshot (wrong content)
     take_initial_snapshot(plan, slug="test", version="v0")
-    snapshot_path = isolated_repo / ".scratch" / "test-v0-plan-snapshot-r1.md"
+    snapshot_path = isolated_repo / ".scratch" / "v0-test-plan-snapshot-r1.md"
     snapshot_path.write_text("# corrupted snapshot — should be ignored\n", encoding="utf-8")
 
     # And a CORRECT round-1 sidecar pointing at the real baseline
@@ -457,7 +457,7 @@ def test_compute_round_diff_branch3_recovers_when_snapshot_mismatched(isolated_r
             "severity_histogram": {"high": 0, "medium": 0, "low": 0},
         },
     }
-    (isolated_repo / "plans" / "fixs" / "test-v0-round-1.json").write_text(
+    (isolated_repo / "plans" / "fixs" / "v0-test-round-1.json").write_text(
         json.dumps(sidecar), encoding="utf-8"
     )
 
@@ -501,7 +501,7 @@ def test_compute_round_diff_warns_on_hash_mismatch(isolated_repo, capsys):
             "severity_histogram": {"high": 0, "medium": 0, "low": 0},
         },
     }
-    (isolated_repo / "plans" / "fixs" / "test-v0-round-1.json").write_text(
+    (isolated_repo / "plans" / "fixs" / "v0-test-round-1.json").write_text(
         json.dumps(sidecar), encoding="utf-8"
     )
 
@@ -525,9 +525,9 @@ def test_cleanup_snapshots_removes_namespaced_files(isolated_repo):
 
     n = cleanup_snapshots(slug="test", version="v0")
     assert n == 1
-    assert not (isolated_repo / ".scratch" / "test-v0-plan-snapshot-r1.md").exists()
+    assert not (isolated_repo / ".scratch" / "v0-test-plan-snapshot-r1.md").exists()
     # Other slug's snapshot survives
-    assert (isolated_repo / ".scratch" / "other-v0-plan-snapshot-r1.md").exists()
+    assert (isolated_repo / ".scratch" / "v0-other-plan-snapshot-r1.md").exists()
 
 
 # --- build_sidecar -----------------------------------------------------------
@@ -583,7 +583,7 @@ def test_write_sidecar_atomic_creates_file(isolated_repo):
     state = _state(round_n=1, baseline="# baseline")
     sidecar = build_sidecar(state, raw_response_text="{}")
     target = write_sidecar_atomic(sidecar, slug="test", version="v0")
-    assert target.name == "test-v0-round-1.json"
+    assert target.name == "v0-test-round-1.json"
     assert target.exists()
     # File is well-formed JSON
     json.loads(target.read_text(encoding="utf-8"))
@@ -610,7 +610,7 @@ def test_load_sidecars_in_numeric_order(isolated_repo, make_sidecar_factory):
             round_n=n, plan_content="# x",
             baseline_plan_content="# x" if n == 1 else None,
         )
-        path = isolated_repo / "plans" / "fixs" / f"test-v0-round-{n}.json"
+        path = isolated_repo / "plans" / "fixs" / f"v0-test-round-{n}.json"
         path.write_text(json.dumps(sidecar), encoding="utf-8")
     sidecars = load_sidecars(slug="test", version="v0")
     assert [s["round"] for s in sidecars] == [1, 2, 3]
@@ -623,7 +623,7 @@ def test_load_sidecars_refuses_non_contiguous(isolated_repo, make_sidecar_factor
             round_n=n, plan_content="# x",
             baseline_plan_content="# x" if n == 1 else None,
         )
-        path = isolated_repo / "plans" / "fixs" / f"test-v0-round-{n}.json"
+        path = isolated_repo / "plans" / "fixs" / f"v0-test-round-{n}.json"
         path.write_text(json.dumps(sidecar), encoding="utf-8")
     with pytest.raises(ResumeIntegrityError, match="Non-contiguous"):
         load_sidecars(slug="test", version="v0")
@@ -678,7 +678,7 @@ def test_detect_resume_finds_prior_runs(isolated_repo, make_sidecar_factory):
             baseline_plan_content="# x" if n == 1 else None,
             cumulative_cost_usd=0.1 * n,
         )
-        path = isolated_repo / "plans" / "fixs" / f"test-v0-round-{n}.json"
+        path = isolated_repo / "plans" / "fixs" / f"v0-test-round-{n}.json"
         path.write_text(json.dumps(sidecar), encoding="utf-8")
 
     status = detect_resume(slug="test", version="v0")
@@ -696,15 +696,15 @@ def test_restore_snapshots_from_sidecars(isolated_repo, make_sidecar_factory):
             plan_content=f"# round-{n} end",
             baseline_plan_content="# baseline" if n == 1 else None,
         )
-        path = isolated_repo / "plans" / "fixs" / f"test-v0-round-{n}.json"
+        path = isolated_repo / "plans" / "fixs" / f"v0-test-round-{n}.json"
         path.write_text(json.dumps(sidecar), encoding="utf-8")
 
     count = restore_snapshots_from_sidecars(slug="test", version="v0")
     assert count == 3  # r1 (baseline), r2 (end of round 1), r3 (end of round 2)
 
-    r1 = isolated_repo / ".scratch" / "test-v0-plan-snapshot-r1.md"
-    r2 = isolated_repo / ".scratch" / "test-v0-plan-snapshot-r2.md"
-    r3 = isolated_repo / ".scratch" / "test-v0-plan-snapshot-r3.md"
+    r1 = isolated_repo / ".scratch" / "v0-test-plan-snapshot-r1.md"
+    r2 = isolated_repo / ".scratch" / "v0-test-plan-snapshot-r2.md"
+    r3 = isolated_repo / ".scratch" / "v0-test-plan-snapshot-r3.md"
     assert r1.read_text(encoding="utf-8") == "# baseline"
     assert r2.read_text(encoding="utf-8") == "# round-1 end"
     assert r3.read_text(encoding="utf-8") == "# round-2 end"
@@ -717,7 +717,7 @@ def test_regenerate_fixes_md_creates_from_sidecars(isolated_repo, make_sidecar_f
     sidecar = make_sidecar_factory(
         round_n=1, plan_content="# x", baseline_plan_content="# y",
     )
-    path = isolated_repo / "plans" / "fixs" / "test-v0-round-1.json"
+    path = isolated_repo / "plans" / "fixs" / "v0-test-round-1.json"
     path.write_text(json.dumps(sidecar), encoding="utf-8")
 
     target = regenerate_fixes_md(slug="test", version="v0")
@@ -734,10 +734,10 @@ def test_regenerate_fixes_md_overwrites_hand_edits(
     sidecar = make_sidecar_factory(
         round_n=1, plan_content="# x", baseline_plan_content="# y",
     )
-    path = isolated_repo / "plans" / "fixs" / "test-v0-round-1.json"
+    path = isolated_repo / "plans" / "fixs" / "v0-test-round-1.json"
     path.write_text(json.dumps(sidecar), encoding="utf-8")
 
-    fixes_md = isolated_repo / "plans" / "fixs" / "test-v0-fixes.md"
+    fixes_md = isolated_repo / "plans" / "fixs" / "v0-test-fixes.md"
     fixes_md.write_text("HAND EDITED — should be overwritten", encoding="utf-8")
 
     regenerate_fixes_md(slug="test", version="v0")
@@ -758,13 +758,13 @@ def test_plan_start_over_excludes_plan_markdown(
     sidecar = make_sidecar_factory(
         round_n=1, plan_content="# x", baseline_plan_content="# y",
     )
-    (isolated_repo / "plans" / "fixs" / "test-v0-round-1.json").write_text(
+    (isolated_repo / "plans" / "fixs" / "v0-test-round-1.json").write_text(
         json.dumps(sidecar), encoding="utf-8"
     )
-    (isolated_repo / "plans" / "fixs" / "test-v0-fixes.md").write_text(
+    (isolated_repo / "plans" / "fixs" / "v0-test-fixes.md").write_text(
         "rendered", encoding="utf-8"
     )
-    (isolated_repo / ".scratch" / "test-v0-plan-snapshot-r1.md").write_text(
+    (isolated_repo / ".scratch" / "v0-test-plan-snapshot-r1.md").write_text(
         "snap", encoding="utf-8"
     )
 
@@ -779,12 +779,12 @@ def test_plan_start_over_excludes_plan_markdown(
 def test_execute_start_over_deletes_files_and_returns_metadata(
     isolated_repo, make_sidecar_factory
 ):
-    sidecar_path = isolated_repo / "plans" / "fixs" / "test-v0-round-1.json"
+    sidecar_path = isolated_repo / "plans" / "fixs" / "v0-test-round-1.json"
     sidecar = make_sidecar_factory(
         round_n=1, plan_content="# x", baseline_plan_content="# y"
     )
     sidecar_path.write_text(json.dumps(sidecar), encoding="utf-8")
-    fixes_md = isolated_repo / "plans" / "fixs" / "test-v0-fixes.md"
+    fixes_md = isolated_repo / "plans" / "fixs" / "v0-test-fixes.md"
     fixes_md.write_text("rendered", encoding="utf-8")
 
     plan_obj = plan_start_over(slug="test", version="v0")
@@ -801,7 +801,7 @@ def test_execute_start_over_deletes_files_and_returns_metadata(
     # `plan_start_over` walks Path("plans/fixs") which is cwd-relative, so
     # paths in deleted_files are relative. Match by suffix instead of full path.
     assert any(
-        p.endswith("test-v0-round-1.json") for p in metadata["deleted_files"]
+        p.endswith("v0-test-round-1.json") for p in metadata["deleted_files"]
     )
 
 

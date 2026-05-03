@@ -38,8 +38,8 @@ If `git` is not available or this is not a git repo, skip the check and warn the
 
 During the entire loop, the only files you may create or edit are:
 
-- `plans/<slug>-<version>.md` — the plan itself
-- `plans/fixs/<slug>-<version>-fixes.md` — the round log
+- `plans/<version>-<slug>.md` — the plan itself
+- `plans/fixs/<version>-<slug>-fixes.md` — the round log
 - `plans/fixs/` directory (create if missing)
 
 **First-run UX exceptions** (Setup step 2 only, not during the loop): when a user supplies an OpenAI API key via `AskUserQuestion`, `first_run.save_openai_key_to_env()` may also write to:
@@ -108,12 +108,12 @@ Stop. Re-read this section. Report what you were about to do, and ask the user w
 3. **Interactively ask the user** for the plan **slug** and **version** (e.g., `optical-lcoe`, `v0.0.5`). Always ask — do not guess from context, do not accept args. Deliberate paths prevent accidental overwrites.
 
 4. Resolve paths in the user's current working directory:
-   - Plan md: `plans/<slug>-<version>.md` — **must already exist**. If missing, fail fast and tell the user to draft it first. This skill does not create plans from scratch.
-   - Fixes md: `plans/fixs/<slug>-<version>-fixes.md` — create with the header below if missing. Append if resuming.
+   - Plan md: `plans/<version>-<slug>.md` — **must already exist**. If missing, fail fast and tell the user to draft it first. This skill does not create plans from scratch.
+   - Fixes md: `plans/fixs/<version>-<slug>-fixes.md` — create with the header below if missing. Append if resuming.
 
 5. Create `plans/fixs/` if it does not exist.
 
-6. **Resume detection (v2 step 4 of §5.0a — Phase 4).** Walk prior round JSON sidecars at `plans/fixs/<slug>-<version>-round-*.json`:
+6. **Resume detection (v2 step 4 of §5.0a — Phase 4).** Walk prior round JSON sidecars at `plans/fixs/<version>-<slug>-round-*.json`:
 
    ```bash
    python -c "
@@ -134,11 +134,11 @@ Stop. Re-read this section. Report what you were about to do, and ask the user w
      sys.path.insert(0, '<skill-dir>/scripts')
      from pathlib import Path
      from loop_state import take_initial_snapshot
-     take_initial_snapshot(Path('plans/<slug>-<version>.md'), slug='<slug>', version='<version>')
+     take_initial_snapshot(Path('plans/<version>-<slug>.md'), slug='<slug>', version='<version>')
      "
      ```
 
-7. **Take initial snapshot before round 1** (already done above if no prior run). The skill writes `.scratch/<slug>-<version>-plan-snapshot-r1.md` as the baseline that round-2's diff will compare against.
+7. **Take initial snapshot before round 1** (already done above if no prior run). The skill writes `.scratch/<version>-<slug>-plan-snapshot-r1.md` as the baseline that round-2's diff will compare against.
 
 ### Fixes md header (only written on first creation)
 
@@ -147,7 +147,7 @@ The header is rendered by `scripts/render_markdown.py` from the round-1 sidecar 
 ```markdown
 # Fixes log: <slug> <version>
 
-- Plan: `plans/<slug>-<version>.md`
+- Plan: `plans/<version>-<slug>.md`
 - Started: <ISO 8601 timestamp>
 - Reviewer: <"OpenAI Responses API (gpt-5.5)" | "Codex CLI (gpt-5.5)">
 - Planner: Claude
@@ -166,7 +166,7 @@ For round 1:
 
 ```bash
 python "<skill-dir>/scripts/build_reviewer_prompt_v2.py" \
-  --plan-file "plans/<slug>-<version>.md" \
+  --plan-file "plans/<version>-<slug>.md" \
   --slug "<slug>" \
   --version "<version>" \
   --round 1 \
@@ -182,7 +182,7 @@ sys.path.insert(0, '<skill-dir>/scripts')
 from pathlib import Path
 from loop_state import compute_round_diff
 diff_text, recovered = compute_round_diff(
-    Path('plans/<slug>-<version>.md'),
+    Path('plans/<version>-<slug>.md'),
     round_n=N, slug='<slug>', version='<version>',
 )
 Path('/tmp/round-N-diff.patch').write_text(diff_text, encoding='utf-8')
@@ -190,7 +190,7 @@ print('recovered_from_git=', recovered)  # True only if .scratch/ wiped + sideca
 "
 
 python "<skill-dir>/scripts/build_reviewer_prompt_v2.py" \
-  --plan-file "plans/<slug>-<version>.md" \
+  --plan-file "plans/<version>-<slug>.md" \
   --slug "<slug>" \
   --version "<version>" \
   --round N \
@@ -308,7 +308,7 @@ state = RoundState(
     reviewer_response=parsed_review_result,   # ReviewResult from step 2
     decisions=[PlannerDecision(...) for ...], # one per finding/open-question
     plan_edits=[PlanEdit(...) for ...],       # one per applied edit
-    plan_content_at_end=Path('plans/<slug>-<version>.md').read_text(encoding='utf-8'),
+    plan_content_at_end=Path('plans/<version>-<slug>.md').read_text(encoding='utf-8'),
     baseline_plan_content=BASELINE_TEXT_IF_ROUND_1_ELSE_NONE,
     cumulative_cost_usd=cumulative_cost,
     duration_seconds=time.time() - round_start_epoch,
@@ -477,7 +477,7 @@ Then tell the user:
 - Severity histogram across the full run (rendered from sidecar.stats)
 - Total cost (USD) — `cumulative_cost_usd` from the final round's sidecar
 - Path to the final plan md
-- Path to the fixes md (full transcript) — note this is the rendered view; the JSON sidecars at `plans/fixs/<slug>-<version>-round-*.json` are the audit-trail source of truth
+- Path to the fixes md (full transcript) — note this is the rendered view; the JSON sidecars at `plans/fixs/<version>-<slug>-round-*.json` are the audit-trail source of truth
 
 If the loop exits at **ceiling hit** and there are still-open items, list them as two separate groups so the user can see what needs a human call outside the loop:
 

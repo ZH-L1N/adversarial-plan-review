@@ -100,8 +100,8 @@ If the loop hits ceiling/cost-cap/planner-lock with open items, the **soft-block
 Two artifacts per round:
 
 ```
-plans/fixs/<slug>-<version>-round-{N}.json       # JSON sidecar — source of truth
-plans/fixs/<slug>-<version>-fixes.md             # Markdown — rendered from sidecars
+plans/fixs/<version>-<slug>-round-{N}.json       # JSON sidecar — source of truth
+plans/fixs/<version>-<slug>-fixes.md             # Markdown — rendered from sidecars
 ```
 
 The JSON sidecar is the audit trail. The markdown is generated from it via [`scripts/render_markdown.py`](scripts/render_markdown.py); hand edits to the markdown are silently overwritten on the next round per [§5.7.5](plans/v2-plan.md). If you want to correct a typo durably, edit the JSON.

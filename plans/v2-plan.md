@@ -52,7 +52,7 @@ Locked decisions from design Q&A (this document supersedes the prior draft):
 | D10 | Cost cap | `ADVERSARIAL_MAX_COST_USD` env var, default `$5` per run; tracks cumulative across rounds; soft-pause for user decision when exceeded |
 | D11 | Diff context to reviewer | Unified diff (`git diff` format) + full plan text for cross-reference |
 | D12 | Prior rejections to reviewer | Yes — pass full prior decisions including rejection reasons |
-| D13 | Snapshot location for uncommitted plans | `.scratch/<slug>-<version>-plan-snapshot-r{N}.md` — gitignored, auto-cleaned on loop exit |
+| D13 | Snapshot location for uncommitted plans | `.scratch/<version>-<slug>-plan-snapshot-r{N}.md` — gitignored, auto-cleaned on loop exit |
 | D14 | Planner edits-applied bullets to reviewer | Yes — alongside diff; reviewer flags disagreement between stated intent and actual edit as a finding |
 | D15 | Open-questions exit gate | Yes — unresolved open-questions block exit; user must answer or explicitly defer |
 | D16 | v1 prompt builder | Keep, renamed `build_reviewer_prompt_v1.py` for Codex-only fallback debugging |
@@ -71,26 +71,26 @@ Locked decisions from design Q&A (this document supersedes the prior draft):
 
 ### 5.0 Allowed write boundary (v2) — replaces v1 contract
 
-v1 SKILL.md restricted writes to `plans/<slug>-<version>.md` and `plans/fixs/<slug>-<version>-fixes.md` only. v2 expands the permitted-write set explicitly to enable the new transport, snapshot, and JSON-sidecar machinery. Anything outside this list remains read-only for the duration of the loop. The git-write prohibition (no `commit`, `add`, `push`, `merge`, `rebase`, `branch`, `reset`, `stash`, `checkout`, `restore`) carries over from v1 unchanged — only read-only git commands (`status`, `log`, `diff`, `ls-files`) are allowed.
+v1 SKILL.md restricted writes to `plans/<version>-<slug>.md` and `plans/fixs/<version>-<slug>-fixes.md` only. v2 expands the permitted-write set explicitly to enable the new transport, snapshot, and JSON-sidecar machinery. Anything outside this list remains read-only for the duration of the loop. The git-write prohibition (no `commit`, `add`, `push`, `merge`, `rebase`, `branch`, `reset`, `stash`, `checkout`, `restore`) carries over from v1 unchanged — only read-only git commands (`status`, `log`, `diff`, `ls-files`) are allowed.
 
 | Path | When written | Tracked in git? |
 |---|---|---|
-| `plans/<slug>-<version>.md` | Per-round plan edits (planner) | ✅ Yes |
-| `plans/fixs/<slug>-<version>-round-{N}.json` | End of each round (atomic write); **source of truth** per §5.7 | ✅ Yes |
-| `plans/fixs/<slug>-<version>-fixes.md` | Rendered from JSON sidecar after each round; not authoritative | ✅ Yes |
-| `.scratch/<slug>-<version>-plan-snapshot-r{N}.md` | Per-round plan snapshot for diff (§5.3.1) | ❌ Gitignored, auto-cleaned on loop exit |
+| `plans/<version>-<slug>.md` | Per-round plan edits (planner) | ✅ Yes |
+| `plans/fixs/<version>-<slug>-round-{N}.json` | End of each round (atomic write); **source of truth** per §5.7 | ✅ Yes |
+| `plans/fixs/<version>-<slug>-fixes.md` | Rendered from JSON sidecar after each round; not authoritative | ✅ Yes |
+| `.scratch/<version>-<slug>-plan-snapshot-r{N}.md` | Per-round plan snapshot for diff (§5.3.1) | ❌ Gitignored, auto-cleaned on loop exit |
 | `.env` | First-run only, when user provides API key (§5.6) | ❌ Gitignored |
 
 The implementer must enforce this set at runtime (e.g. wrap file writes in a guard that rejects paths outside the allowed list). Code, tests, configs, and any other repo content remain read-only.
 
-**Destructive operations within the slug/version artifact set.** The "Start over" branch of the resume flow (§5.9) needs to delete prior round sidecars and the rendered fixes-md before round 1 begins anew. This is explicitly permitted, scoped to the current `<slug>-<version>` triple, and gated behind an explicit user confirmation listing every file to be deleted:
+**Destructive operations within the slug/version artifact set.** The "Start over" branch of the resume flow (§5.9) needs to delete prior round sidecars and the rendered fixes-md before round 1 begins anew. This is explicitly permitted, scoped to the current `<version>-<slug>` triple, and gated behind an explicit user confirmation listing every file to be deleted:
 
 | Operation | Permitted target | Required gate |
 |---|---|---|
-| Delete sidecars | `plans/fixs/<slug>-<version>-round-{N}.json` (any N) | `AskUserQuestion` showing exact file list |
-| Delete fixes-md | `plans/fixs/<slug>-<version>-fixes.md` | Same prompt as above |
-| Delete snapshots | `.scratch/<slug>-<version>-plan-snapshot-r{N}.md` (any N) | Implicit — gitignored, no audit value |
-| Delete plan markdown | `plans/<slug>-<version>.md` | **NEVER permitted.** The plan itself is user-authored and out of scope for any skill-driven destructive op. |
+| Delete sidecars | `plans/fixs/<version>-<slug>-round-{N}.json` (any N) | `AskUserQuestion` showing exact file list |
+| Delete fixes-md | `plans/fixs/<version>-<slug>-fixes.md` | Same prompt as above |
+| Delete snapshots | `.scratch/<version>-<slug>-plan-snapshot-r{N}.md` (any N) | Implicit — gitignored, no audit value |
+| Delete plan markdown | `plans/<version>-<slug>.md` | **NEVER permitted.** The plan itself is user-authored and out of scope for any skill-driven destructive op. |
 
 Any deletion must log the intended file list to stderr before prompting and to the new round-1 sidecar's `restart_metadata` field after confirmation, so the audit trail records what was wiped. If the user wants to preserve prior history without forking the version, the alternative is to bump version (e.g. `<version>-rerun-1`), which avoids deletion entirely; the resume UX should suggest this as the default.
 
@@ -102,7 +102,7 @@ The skill executes its startup steps in this exact order. Mixing steps risks amb
 
 1. **Pre-flight git check** — read-only `git status --porcelain`. Refuse to run if uncommitted changes outside `plans/`.
 2. **Transport check + first-run UX** (§5.6) — confirm `OPENAI_API_KEY` or Codex CLI is available. Runs before slug/version because the user may need to configure transport before naming a plan.
-3. **Slug/version prompt** — interactive `AskUserQuestion`. Resolves plan path `plans/<slug>-<version>.md` (must already exist) and fixes-md path `plans/fixs/<slug>-<version>-fixes.md`.
+3. **Slug/version prompt** — interactive `AskUserQuestion`. Resolves plan path `plans/<version>-<slug>.md` (must already exist) and fixes-md path `plans/fixs/<version>-<slug>-fixes.md`.
 4. **Resume detection** (§5.9) — needs slug/version to locate prior round-N JSON sidecars. Prompts user to resume from round N+1 or restart.
 5. **Begin round 1** (or round N+1 on resume).
 
@@ -361,7 +361,7 @@ The planner rejected these findings; do NOT re-raise unless new evidence:
 
 <plan_diff>
 <!-- unified diff between plan_v_n-1 and plan_v_n -->
-diff --git a/plans/<slug>-<version>.md b/plans/<slug>-<version>.md
+diff --git a/plans/<version>-<slug>.md b/plans/<version>-<slug>.md
 @@ -42,6 +42,12 @@
  ...
 </plan_diff>
@@ -699,8 +699,8 @@ Cached: once `OPENAI_API_KEY` is in `.env`, subsequent runs skip the prompt (D7)
 
 Each round produces **two** persisted artifacts. The JSON sidecar is the **authoritative source of truth**; the markdown fixes-md is rendered from it.
 
-1. **JSON sidecar** — `plans/fixs/<slug>-<version>-round-{N}.json`. Schema-validated structured record. This is the source of truth for the loop state machine, cost tracker, severity histograms, and any future tooling.
-2. **Markdown fixes-md** — `plans/fixs/<slug>-<version>-fixes.md`. Append-only human-readable transcript, **rendered from the per-round JSON sidecars** at the end of each round (§5.7.6). Humans read this; nothing programmatic depends on it.
+1. **JSON sidecar** — `plans/fixs/<version>-<slug>-round-{N}.json`. Schema-validated structured record. This is the source of truth for the loop state machine, cost tracker, severity histograms, and any future tooling.
+2. **Markdown fixes-md** — `plans/fixs/<version>-<slug>-fixes.md`. Append-only human-readable transcript, **rendered from the per-round JSON sidecars** at the end of each round (§5.7.6). Humans read this; nothing programmatic depends on it.
 
 Both files are **committed to the repo** alongside the plan. They are NOT gitignored — both are part of the audit trail.
 
@@ -891,8 +891,8 @@ The sidecar carries the **full plan markdown text at end of round N** in the `pl
 
 | Resume scenario | Source for prior plan state |
 |---|---|
-| `.scratch/<slug>-<version>-plan-snapshot-r{N-1}.md` exists AND hash matches sidecar | Use snapshot file. Validation hash source depends on snapshot index (round-10 finding 2): r1 → round-1 sidecar's `baseline_plan_content_sha256`; rN for N≥2 → sidecar-(N-1)'s `plan_content_sha256`. Always hash-validated, never "used directly" (round-7 finding 1). |
-| Snapshot missing OR hash-mismatched, sidecar content validates | Call `_recover_snapshot_from_sidecar(N-1, slug, version)`; materialize recovered text to `.scratch/<slug>-<version>-plan-snapshot-r{N-1}.md` for downstream snapshot use. Recovery source mirrors validation: r1 from round-1 sidecar's `baseline_plan_content`; rN for N≥2 from sidecar-(N-1)'s `plan_content`. |
+| `.scratch/<version>-<slug>-plan-snapshot-r{N-1}.md` exists AND hash matches sidecar | Use snapshot file. Validation hash source depends on snapshot index (round-10 finding 2): r1 → round-1 sidecar's `baseline_plan_content_sha256`; rN for N≥2 → sidecar-(N-1)'s `plan_content_sha256`. Always hash-validated, never "used directly" (round-7 finding 1). |
+| Snapshot missing OR hash-mismatched, sidecar content validates | Call `_recover_snapshot_from_sidecar(N-1, slug, version)`; materialize recovered text to `.scratch/<version>-<slug>-plan-snapshot-r{N-1}.md` for downstream snapshot use. Recovery source mirrors validation: r1 from round-1 sidecar's `baseline_plan_content`; rN for N≥2 from sidecar-(N-1)'s `plan_content`. |
 | Both missing | Last-resort: cumulative-against-HEAD diff via `_recover_diff_from_git()` with banner; otherwise refuse to resume |
 
 This closes round-3 finding 3: the sidecar is now self-sufficient for accurate round-N-1→N diff reconstruction, regardless of `.scratch/` state. Per-round sidecar size grows by the plan text size (~10-30KB per round for typical plans), which is fine — sidecars are committed to the audit trail anyway and reads are infrequent.
@@ -996,7 +996,7 @@ if sidecars:
       - **rN for N ≥ 2:** validate against sidecar-(N-1)'s `plan_content_sha256` (which represents end-of-round-(N-1) = start-of-round-N).
 
       A namespaced snapshot whose content does not match the appropriate hash is treated as missing and routes to step 4.2.
-   2. **Snapshot missing or hash-mismatched, but sidecar's `plan_content` validates** — call `_recover_snapshot_from_sidecar(N, slug, version)`, materialize the recovered text to `.scratch/<slug>-<version>-plan-snapshot-r{N}.md`, then proceed normally.
+   2. **Snapshot missing or hash-mismatched, but sidecar's `plan_content` validates** — call `_recover_snapshot_from_sidecar(N, slug, version)`, materialize the recovered text to `.scratch/<version>-<slug>-plan-snapshot-r{N}.md`, then proceed normally.
    3. **Both snapshot and sidecar content unavailable** — fall back to `_recover_diff_from_git()` with the cumulative-against-HEAD banner in the round-N+1 reviewer prompt. This is a degraded mode and the user is warned.
 
    Git fallback is the **last resort**, not an automatic preference whenever snapshots are absent. Round-5 finding 1 closes the contradiction between §5.3.1 (which already had the right order) and §5.9 (which previously said "git fallback on missing snapshot"). Round-7 finding 1 closes the "use existing snapshot as-is" loophole — every snapshot use is hash-gated. Phase 4 verification adds `test_resume_recovers_snapshot_from_sidecar_when_scratch_deleted` and `test_resume_rejects_stale_snapshot_via_hash_mismatch` to lock in the priority order against future regressions.

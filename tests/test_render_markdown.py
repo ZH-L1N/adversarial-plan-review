@@ -292,7 +292,7 @@ def test_render_restart_metadata_when_present(make_sidecar_factory):
         baseline_plan_content="# fresh",
         restart_metadata={
             "timestamp": "2026-05-03T00:00:00Z",
-            "deleted_files": ["plans/fixs/test-v0-round-1.json", "plans/fixs/test-v0-round-2.json"],
+            "deleted_files": ["plans/fixs/v0-test-round-1.json", "plans/fixs/v0-test-round-2.json"],
             "user_decision": "user chose start over",
             "previous_run_summary": {"last_round": 5, "last_status": "ceiling_hit"},
         },
@@ -302,7 +302,7 @@ def test_render_restart_metadata_when_present(make_sidecar_factory):
     assert "user chose start over" in md
     assert "5 rounds" in md
     assert "ceiling_hit" in md
-    assert "plans/fixs/test-v0-round-1.json" in md
+    assert "plans/fixs/v0-test-round-1.json" in md
 
 
 # --- render_header ----------------------------------------------------------
@@ -317,7 +317,7 @@ def test_render_header_basic():
         model="gpt-5.5",
     )
     assert "# Fixes log: optical-lcoe v0.0.5" in header
-    assert "Plan: `plans/optical-lcoe-v0.0.5.md`" in header
+    assert "Plan: `plans/v0.0.5-optical-lcoe.md`" in header
     assert "Started: 2026-04-20T02:12:56Z" in header
     assert "OpenAI Responses API (gpt-5.5)" in header
     assert "Termination rules: severity-gated exit" in header

@@ -140,7 +140,7 @@ def test_e2e_three_findings_converges_round_2(isolated_repo):
     assert decision1.reason == ExitReason.RESOLVED  # all 3 decided, 0 open
 
     # Verify the fixes-md was rendered
-    fixes_md = isolated_repo / "plans" / "fixs" / "synth-v0-fixes.md"
+    fixes_md = isolated_repo / "plans" / "fixs" / "v0-synth-fixes.md"
     assert fixes_md.exists()
     md_content = fixes_md.read_text(encoding="utf-8")
     assert "## Round 1" in md_content
@@ -318,7 +318,7 @@ def test_e2e_full_round_persistence_round_trip(isolated_repo):
 
     # Regenerate markdown — must include round 1
     regenerate_fixes_md(slug=slug, version=version)
-    fixes_md = (isolated_repo / "plans" / "fixs" / "synth-v0-fixes.md").read_text(
+    fixes_md = (isolated_repo / "plans" / "fixs" / "v0-synth-fixes.md").read_text(
         encoding="utf-8"
     )
     assert "## Round 1" in fixes_md
