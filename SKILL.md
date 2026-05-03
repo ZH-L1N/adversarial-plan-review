@@ -7,8 +7,10 @@ description: Run a GAN-style adversarial review loop on a plan markdown file whe
 
 Two roles, two different models, one loop.
 
-- **Reviewer** — Codex CLI (GPT-5 via user's ChatGPT auth). Adversarial discriminator. Tries to break confidence in the plan. Returns numbered findings or the exact token `NO FINDINGS`.
+- **Reviewer** — auto-detected per Setup step 2. Default is **OpenAI Responses API** (`gpt-5.5`) when `OPENAI_API_KEY` is set; falls back to **Codex CLI** (`gpt-5.5` via ChatGPT auth) otherwise. Adversarial discriminator: tries to break confidence in the plan. The OpenAI path returns schema-validated, severity-tagged findings (`high|medium|low`); the Codex path returns prose findings with severity inferred via keyword heuristic.
 - **Planner** — You (Claude). Go through each finding, accept or reject with concrete reasoning, edit the plan for accepted findings. The split between writer and reviewer is the whole point: it prevents the planner from rationalizing its own blind spots.
+
+**v2 status (alpha):** Phases 1+2 are live (transport abstraction + structured outputs with severity tags). Phases 3+4 (diff-aware reviewing, severity-gated exit, plan-bloat detection, resume support) are in-flight. See `plans/v2-plan.md` for the full design.
 
 ## Why this shape
 
@@ -40,6 +42,13 @@ During the entire loop, the only files you may create or edit are:
 - `plans/fixs/<slug>-<version>-fixes.md` — the round log
 - `plans/fixs/` directory (create if missing)
 
+**First-run UX exceptions** (Setup step 2 only, not during the loop): when a user supplies an OpenAI API key via `AskUserQuestion`, `first_run.save_openai_key_to_env()` may also write to:
+
+- `.env` — creates or updates the `OPENAI_API_KEY=...` line; gitignored
+- `.gitignore` — appends `.env` if not already listed; best-effort
+
+These writes only happen during the first-run prompt branch in Setup step 2 and are scoped to those two paths. Once the loop proper begins (Loop step 1+ below), the boundary above is restored — no `.env` or `.gitignore` writes during the loop itself.
+
 **Every other file is read-only for the duration of this skill.** If a Codex finding calls for code changes, tests, config edits, etc., **do not implement them**. Record the recommendation in the fixes md under "Plan edits applied" as a deferred action (e.g., *"Deferred to implementation: add unit test for X — not performed in this loop"*). The plan review loop produces a better plan; implementation happens in a separate session.
 
 ### Git prohibition
@@ -64,12 +73,45 @@ Stop. Re-read this section. Report what you were about to do, and ask the user w
 
 ## Setup
 
-1. Confirm the Codex plugin is available: either `${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs` resolves, or `/codex:setup` reports ready. If not, stop and tell the user to install/configure the Codex plugin.
-2. **Interactively ask the user** for the plan **slug** and **version** (e.g., `optical-lcoe`, `v0.0.5`). Always ask — do not guess from context, do not accept args. Deliberate paths prevent accidental overwrites.
-3. Resolve paths in the user's current working directory:
+> **v2 (alpha):** Phases 1+2 of the v2 plan are live. Transport now auto-detects between OpenAI Responses API (`gpt-5.5`, default if `OPENAI_API_KEY` is set) and Codex CLI (legacy fallback). Findings are tagged with severity (`high|medium|low`) when the OpenAI path is used. Loop termination still follows v1 rules; severity-gated exit lands in Phase 4.
+
+1. **Pre-flight check.** Run `git status --porcelain` and refuse to start if any modified/added/deleted files exist outside `plans/`.
+
+2. **Transport check + first-run UX (v2 step 2 of §5.0a in plans/v2-plan.md).** Run:
+
+   ```bash
+   python "<skill-dir>/scripts/first_run.py" --check
+   ```
+
+   If exit code 0, the script prints which transport will be used (`openai` or `codex`); proceed to step 3.
+
+   If exit code 2, no transport is configured. Use `AskUserQuestion` to ask the user how to proceed:
+
+   - **Option A — "I have an OpenAI API key (recommended)":** ask the user to paste the key (text input via `AskUserQuestion` "Other" free-form), then call:
+
+     ```python
+     # in a small inline Python snippet you run via Bash; mirrors the
+     # sys.path setup the loop step 2 snippet uses so `first_run` can find
+     # its sibling `reviewer` module.
+     import sys
+     sys.path.insert(0, "<skill-dir>/scripts")
+     from first_run import save_openai_key_to_env
+     save_openai_key_to_env(USER_PROVIDED_KEY)
+     ```
+
+     Then re-run `first_run.py --check`. It should now report `transport ready: openai`.
+
+   - **Option B — "I have Codex CLI installed":** run `/codex:setup` and re-run the check.
+
+   - **Option C — "I need help setting one up":** print `setup_guide_text()` from `first_run.py` and exit; the user configures and re-invokes the skill.
+
+3. **Interactively ask the user** for the plan **slug** and **version** (e.g., `optical-lcoe`, `v0.0.5`). Always ask — do not guess from context, do not accept args. Deliberate paths prevent accidental overwrites.
+
+4. Resolve paths in the user's current working directory:
    - Plan md: `plans/<slug>-<version>.md` — **must already exist**. If missing, fail fast and tell the user to draft it first. This skill does not create plans from scratch.
    - Fixes md: `plans/fixs/<slug>-<version>-fixes.md` — create with the header below if missing. Append if resuming.
-4. Create `plans/fixs/` if it does not exist.
+
+5. Create `plans/fixs/` if it does not exist.
 
 ### Fixes md header (only written on first creation)
 
@@ -78,9 +120,9 @@ Stop. Re-read this section. Report what you were about to do, and ask the user w
 
 - Plan: `plans/<slug>-<version>.md`
 - Started: <ISO 8601 timestamp>
-- Reviewer: Codex CLI (GPT-5, via `codex-companion.mjs task`)
+- Reviewer: <auto-detected per first_run.py — "OpenAI Responses API (gpt-5.5)" or "Codex CLI (gpt-5.5, via codex-companion.mjs)">
 - Planner: Claude
-- Termination rules: planner-rejects-all | NO FINDINGS | 10-round ceiling
+- Termination rules: planner-rejects-all | NO FINDINGS | 10-round ceiling (v1; Phase 4 will replace with severity-gated exit)
 ```
 
 ## Loop
@@ -98,23 +140,62 @@ python "<skill-dir>/scripts/build_reviewer_prompt.py" \
   --round N
 ```
 
-The script emits the full adversarial prompt to stdout, including prior rounds from the fixes md so Codex has continuity.
+The script emits the full adversarial prompt to stdout, including prior rounds from the fixes md so the reviewer has continuity. (Phase 3 will swap this for the diff-aware `build_reviewer_prompt_v2.py`; v1 builder remains the active builder for Phase 1+2.)
 
-**2. Invoke Codex (foreground, read-only, pinned model).**
+**2. Invoke the reviewer (foreground, read-only).**
+
+The transport (`openai` or `codex`) is auto-detected at skill start (Setup step 2). Use `scripts/reviewer.py` regardless of which transport — it abstracts the difference:
 
 ```bash
-PROMPT="$(python <skill-dir>/scripts/build_reviewer_prompt.py --plan-file ... --fixes-file ... --round N)"
-node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task --model gpt-5.4 "$PROMPT"
+# in a small inline Python snippet you run via Bash, after building the prompt above
+python -c "
+import sys, json, re
+from pathlib import Path
+sys.path.insert(0, '<skill-dir>/scripts')
+from reviewer import invoke_reviewer
+
+SLUG, VERSION, ROUND_N = '<slug>', '<version>', N
+fixes_path = Path(f'plans/fixs/{SLUG}-{VERSION}-fixes.md')
+
+result = invoke_reviewer(open('/tmp/round-N-prompt.txt').read(), round_n=ROUND_N)
+
+# Compute cumulative cost from prior round-stats blocks in the fixes-md.
+# (Phase 4 will replace this with sidecar-based recovery.)
+prior_cumulative = 0.0
+if fixes_path.exists():
+    text = fixes_path.read_text(encoding='utf-8')
+    matches = re.findall(r'cumulative:\s*\\\$([0-9.]+)', text)
+    if matches:
+        prior_cumulative = float(matches[-1])
+cumulative_cost_usd = prior_cumulative + result.usage.cost_usd
+
+print(json.dumps({
+  'status': result.status,
+  'findings': [f.to_dict() for f in result.findings],
+  'open_questions': [oq.to_dict() for oq in result.open_questions],
+  'transport': result.transport,
+  'model': result.model,
+  'tokens_input': result.usage.tokens_input,
+  'tokens_output': result.usage.tokens_output,
+  'cost_usd': result.usage.cost_usd,
+  'cumulative_cost_usd': round(cumulative_cost_usd, 4),
+  'raw_response_text': result.raw_response_text,
+}))
+"
 ```
 
-Omit `--write`. Run foreground so the output comes back in the same turn — no `/codex:status` polling.
+The reviewer module:
+- Picks transport via env (`ADVERSARIAL_TRANSPORT`, then `OPENAI_API_KEY`, then Codex availability)
+- For OpenAI: uses Responses API with strict JSON schema (`gpt-5.5` default), guaranteeing severity-tagged findings
+- For Codex: pipes prompt via stdin (Windows-safe; bypasses argv length limits), then runs the keyword-based severity heuristic
+- Returns a normalized `ReviewResult` with `status`, `findings`, `open_questions`, transport metadata, and usage figures
 
-**Fallback:** if Codex rejects `gpt-5.4` as an unknown model, retry without `--model`. Do this silently the first time; note it in the fixes md round section.
+**3. Interpret the result.**
 
-**3. Capture Codex output.** Trim leading/trailing whitespace. Check for the exact sentinel `NO FINDINGS`.
+- If `result.status == "NO_FINDINGS"` → schema guarantees `findings` and `open_questions` are both empty. Append a clean round section to fixes md and **exit with approved**.
+- If `result.status == "FINDINGS_PRESENT"` → at least one finding OR open question. Both feed step 4.
 
-- If `NO FINDINGS` → append a round section to fixes md recording the clean review, then **exit with approved**.
-- Otherwise → parse numbered findings. If an `OPEN QUESTIONS:` block is present after the findings, parse it separately. Both feed step 4.
+(Schema invariant: NO_FINDINGS implies no open questions, and FINDINGS_PRESENT carries at least one finding or open question. See plans/v2-plan.md §5.2. The Codex prose path coerces ambiguous outputs to match the same invariant before returning.)
 
 **4. Planner decision pass.** For each numbered finding, decide **Accept**, **Reject**, or **Uncertain**.
 
@@ -141,14 +222,23 @@ Do not edit the plan md or make any further decisions until the user responds. W
 
 **5. Edit the plan md.** For every accepted finding (including user-resolved Accepts), make the stated change now. All edits for the round happen *after* user consultation is resolved — no mid-round edits. Targeted edits only; do not restructure the whole plan unless a finding specifically requires it.
 
-**6. Append to the fixes md.** Use this exact structure:
+**6. Append to the fixes md.** Use this exact structure (note: outer fence is 4 backticks so the inner 3-backtick fence around the raw response renders correctly):
 
-```markdown
+````markdown
 ## Round N — <ISO 8601 timestamp>
 
-### Reviewer findings (Codex)
-<verbatim Codex output — the numbered list it produced, including any
-OPEN QUESTIONS: block>
+### Reviewer findings (<transport>)
+1. **[HIGH]** [<category>] <what_can_go_wrong>
+   *Concrete fix:* <concrete_fix>
+2. **[MEDIUM]** [<category>] <what_can_go_wrong>
+   *Concrete fix:* <concrete_fix>
+...
+
+OPEN QUESTIONS:
+- (oq_rN_1) <question text>
+- (oq_rN_2) <question text>
+
+(omit OPEN QUESTIONS section if open_questions is empty)
 
 ### Planner decisions (Claude)
 1. **Accept** — <what will change in the plan md>
@@ -158,11 +248,10 @@ OPEN QUESTIONS: block>
 ...
 
 ### Open questions and uncertainty
-(include this section ONLY if the round had any Uncertain findings or a Codex
-OPEN QUESTIONS: block; omit entirely otherwise)
+(include this section ONLY if the round had any Uncertain findings or a non-empty open_questions list; omit entirely otherwise)
 
-- Codex open questions (verbatim):
-  - ...
+- Reviewer open questions (verbatim):
+  - (oq_rN_1) ...
 - Planner-uncertain findings:
   - Finding N — <why uncertain>
 
@@ -172,14 +261,32 @@ OPEN QUESTIONS: block; omit entirely otherwise)
 > <paste the user's answer verbatim, attribution: "User via AskUserQuestion">
 
 - Finding N → <Accept | Reject | specific guidance>
-- Codex Q1 → <user's answer, condensed>
+- Open question oq_rN_1 → <user's answer, condensed>
 
 ### Plan edits applied
 - <bullet: section updated>
 - <bullet: verification step added>
 
 (or: "None — all findings rejected")
+
+### Round stats
+- Reviewer: <transport> (<model>)
+- Tokens: <tokens_input> input / <tokens_output> output
+- Cost: $<cost_usd> (cumulative: $<cumulative_cost_usd>)
+- Severity histogram: high=<H>, medium=<M>, low=<L>
+- Plan size: <chars> chars
+
+### Reviewer raw response
+```text
+<verbatim raw_response_text from the ReviewResult — JSON for OpenAI path, prose for Codex>
 ```
+````
+
+**Severity prefix rules:**
+- OpenAI transport: severity comes directly from the schema-validated response (`high|medium|low`)
+- Codex transport: severity is inferred via keyword heuristic in `parse_review.py` (silent/data-loss/security → high; gap/ambiguous/missing-test → medium; otherwise low). Documented as best-effort.
+
+**Open-question IDs (`oq_rN_<index>`)** are assigned post-parse by `assign_open_question_ids()` in `parse_review.py`. They are stable within a round and unique across rounds. Reference these IDs in the `User resolution` section when a question gets answered.
 
 Every user-supplied decision must also appear in the `Planner decisions` list tagged `(via user)` so termination logic can scan a single list.
 
