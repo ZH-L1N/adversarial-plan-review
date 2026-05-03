@@ -520,6 +520,26 @@ def validate_sidecar(sidecar: dict[str, Any]) -> None:
     except jsonschema.ValidationError as exc:
         raise SidecarSchemaError(str(exc)) from exc
 
+    # JSON Schema can't express "this hash matches that content" — verify
+    # SHA-256 round-trip post-schema. Both plan_content and (round-1 only)
+    # baseline_plan_content must hash to their declared *_sha256 values.
+    actual_sha = hashlib.sha256(sidecar["plan_content"].encode("utf-8")).hexdigest()
+    if actual_sha != sidecar["plan_content_sha256"]:
+        raise SidecarSchemaError(
+            f"plan_content_sha256 mismatch: declared {sidecar['plan_content_sha256'][:8]}…, "
+            f"computed {actual_sha[:8]}…"
+        )
+    if sidecar["round"] == 1 and sidecar.get("baseline_plan_content"):
+        actual_baseline = hashlib.sha256(
+            sidecar["baseline_plan_content"].encode("utf-8")
+        ).hexdigest()
+        if actual_baseline != sidecar["baseline_plan_content_sha256"]:
+            raise SidecarSchemaError(
+                f"baseline_plan_content_sha256 mismatch: "
+                f"declared {sidecar['baseline_plan_content_sha256'][:8]}…, "
+                f"computed {actual_baseline[:8]}…"
+            )
+
 
 class SidecarSchemaError(RuntimeError):
     """Sidecar JSON failed schema validation."""
