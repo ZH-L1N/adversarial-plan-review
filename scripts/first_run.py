@@ -30,11 +30,16 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from _dotenv import load_local_env
 from reviewer import (
     TransportSelection,
     TransportUnavailableError,
     detect_transport,
 )
+
+# Load .env from cwd or skill root before any env-var read. Shell-provided
+# values still win; .env only fills in keys the shell didn't set.
+load_local_env()
 
 
 # --- Errors ------------------------------------------------------------------

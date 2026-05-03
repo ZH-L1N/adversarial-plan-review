@@ -25,6 +25,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 
+from _dotenv import load_local_env
 from parse_review import (
     REVIEW_SCHEMA,
     ReviewResult,
@@ -33,6 +34,11 @@ from parse_review import (
     parse_openai_response,
 )
 from cost_tracker import estimate_cost_usd
+
+# Populate os.environ from .env (shell values win) so OPENAI_API_KEY and
+# friends are visible whether the user exported them or just wrote them to
+# the skill's .env file.
+load_local_env()
 
 DEFAULT_OPENAI_MODEL = "gpt-5.5"
 DEFAULT_CODEX_MODEL = "gpt-5.5"
