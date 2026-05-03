@@ -113,16 +113,45 @@ Stop. Re-read this section. Report what you were about to do, and ask the user w
 
 5. Create `plans/fixs/` if it does not exist.
 
+6. **Resume detection (v2 step 4 of §5.0a — Phase 4).** Walk prior round JSON sidecars at `plans/fixs/<slug>-<version>-round-*.json`:
+
+   ```bash
+   python -c "
+   import sys
+   sys.path.insert(0, '<skill-dir>/scripts')
+   from loop_state import detect_resume
+   status = detect_resume(slug='<slug>', version='<version>')
+   print(status)
+   "
+   ```
+
+   - If `has_prior_run=True`, use `AskUserQuestion` to ask the user: **(a)** Resume from round N+1, **(b)** Start over (destructive — see §5.0 destructive ops table; lists files to delete before confirmation), or **(c)** Cancel.
+   - If `has_prior_run=False`, take the initial baseline snapshot:
+
+     ```bash
+     python -c "
+     import sys
+     sys.path.insert(0, '<skill-dir>/scripts')
+     from pathlib import Path
+     from loop_state import take_initial_snapshot
+     take_initial_snapshot(Path('plans/<slug>-<version>.md'), slug='<slug>', version='<version>')
+     "
+     ```
+
+7. **Take initial snapshot before round 1** (already done above if no prior run). The skill writes `.scratch/<slug>-<version>-plan-snapshot-r1.md` as the baseline that round-2's diff will compare against.
+
 ### Fixes md header (only written on first creation)
+
+The header is rendered by `scripts/render_markdown.py` from the round-1 sidecar after the round completes. The rendered text matches:
 
 ```markdown
 # Fixes log: <slug> <version>
 
 - Plan: `plans/<slug>-<version>.md`
 - Started: <ISO 8601 timestamp>
-- Reviewer: <auto-detected per first_run.py — "OpenAI Responses API (gpt-5.5)" or "Codex CLI (gpt-5.5, via codex-companion.mjs)">
+- Reviewer: <"OpenAI Responses API (gpt-5.5)" | "Codex CLI (gpt-5.5)">
 - Planner: Claude
-- Termination rules: planner-rejects-all | NO FINDINGS | 10-round ceiling (v1; Phase 4 will replace with severity-gated exit)
+- Termination rules: severity-gated exit | NO FINDINGS | ceiling hit | planner-locked | cost-capped (v2; see plans/v2-plan.md §5.4)
 ```
 
 ## Loop
@@ -131,16 +160,48 @@ Stop. Re-read this section. Report what you were about to do, and ask the user w
 
 **1. Build the reviewer prompt.**
 
-Locate this skill's directory (the folder containing this SKILL.md). Then:
+Locate this skill's directory (the folder containing this SKILL.md). Use the diff-aware v2 builder (`build_reviewer_prompt_v2.py`); the v1 builder is kept only for fallback debugging.
+
+For round 1:
 
 ```bash
-python "<skill-dir>/scripts/build_reviewer_prompt.py" \
+python "<skill-dir>/scripts/build_reviewer_prompt_v2.py" \
   --plan-file "plans/<slug>-<version>.md" \
-  --fixes-file "plans/fixs/<slug>-<version>-fixes.md" \
-  --round N
+  --slug "<slug>" \
+  --version "<version>" \
+  --round 1 \
+  > /tmp/round-1-prompt.txt
 ```
 
-The script emits the full adversarial prompt to stdout, including prior rounds from the fixes md so the reviewer has continuity. (Phase 3 will swap this for the diff-aware `build_reviewer_prompt_v2.py`; v1 builder remains the active builder for Phase 1+2.)
+For round N > 1, first compute the diff via `loop_state.compute_round_diff()`, then pass it to the builder:
+
+```bash
+python -c "
+import sys
+sys.path.insert(0, '<skill-dir>/scripts')
+from pathlib import Path
+from loop_state import compute_round_diff
+diff_text, recovered = compute_round_diff(
+    Path('plans/<slug>-<version>.md'),
+    round_n=N, slug='<slug>', version='<version>',
+)
+Path('/tmp/round-N-diff.patch').write_text(diff_text, encoding='utf-8')
+print('recovered_from_git=', recovered)  # True only if .scratch/ wiped + sidecars unrecoverable
+"
+
+python "<skill-dir>/scripts/build_reviewer_prompt_v2.py" \
+  --plan-file "plans/<slug>-<version>.md" \
+  --slug "<slug>" \
+  --version "<version>" \
+  --round N \
+  --diff-file /tmp/round-N-diff.patch \
+  $(test "$RECOVERED" = "True" && echo "--diff-recovered-from-git") \
+  $(test "$CONSISTENCY_ONLY" = "True" && echo "--consistency-only") \
+  --cumulative-cost-usd "$CUMULATIVE_COST" \
+  > /tmp/round-N-prompt.txt
+```
+
+The builder emits a richer prompt with prior-rounds summary, accepted findings to verify, rejected findings for context, the unified diff, and the full plan for cross-reference. See plans/v2-plan.md §5.3.
 
 **2. Invoke the reviewer (foreground, read-only).**
 
@@ -222,7 +283,45 @@ Do not edit the plan md or make any further decisions until the user responds. W
 
 **5. Edit the plan md.** For every accepted finding (including user-resolved Accepts), make the stated change now. All edits for the round happen *after* user consultation is resolved — no mid-round edits. Targeted edits only; do not restructure the whole plan unless a finding specifically requires it.
 
-**6. Append to the fixes md.** Use this exact structure (note: outer fence is 4 backticks so the inner 3-backtick fence around the raw response renders correctly):
+**6. Persist the round (v2 — sidecar-first; markdown rendered from sidecar).**
+
+The JSON sidecar is the source of truth (§5.7). Build a `RoundState`, call `build_sidecar()`, write atomically, then re-render the fixes-md from all sidecars in order:
+
+```bash
+python -c "
+import sys, time
+sys.path.insert(0, '<skill-dir>/scripts')
+from datetime import datetime, timezone
+from pathlib import Path
+from loop_state import (
+    RoundState, PlannerDecision, PlanEdit,
+    build_sidecar, write_sidecar_atomic, regenerate_fixes_md,
+    cleanup_snapshots,
+)
+
+# Construct the RoundState from the reviewer result (captured in step 2)
+# and the planner decisions + plan edits (captured in steps 4-5).
+state = RoundState(
+    round_n=N, slug='<slug>', version='<version>',
+    transport=result_transport, model=result_model,
+    started_at=ROUND_START_ISO, completed_at=datetime.now(tz=timezone.utc).isoformat(),
+    reviewer_response=parsed_review_result,   # ReviewResult from step 2
+    decisions=[PlannerDecision(...) for ...], # one per finding/open-question
+    plan_edits=[PlanEdit(...) for ...],       # one per applied edit
+    plan_content_at_end=Path('plans/<slug>-<version>.md').read_text(encoding='utf-8'),
+    baseline_plan_content=BASELINE_TEXT_IF_ROUND_1_ELSE_NONE,
+    cumulative_cost_usd=cumulative_cost,
+    duration_seconds=time.time() - round_start_epoch,
+    plan_size_delta=current_plan_size - previous_plan_size,
+)
+
+sidecar = build_sidecar(state, raw_response_text=result_raw_response_text)
+write_sidecar_atomic(sidecar, slug='<slug>', version='<version>')
+regenerate_fixes_md(slug='<slug>', version='<version>')  # markdown is derived
+"
+```
+
+The rendered fixes-md follows this structure (rendered by `render_markdown.py`; do NOT hand-edit — the next round's regenerate_fixes_md call will overwrite). The outer fence below is 4 backticks so the inner 3-backtick fence around the raw response renders correctly:
 
 ````markdown
 ## Round N — <ISO 8601 timestamp>
@@ -290,21 +389,95 @@ OPEN QUESTIONS:
 
 Every user-supplied decision must also appear in the `Planner decisions` list tagged `(via user)` so termination logic can scan a single list.
 
-**7. Termination check.**
+**7. Termination check (v2 — severity-gated; §5.4).**
 
-- Every finding in this round was rejected → **exit planner-locked**. User-supplied Rejects (from step 4a) count identically to planner-supplied Rejects — a round where every finding ends up rejected by any combination of planner and user still locks the loop.
-- N == 10 → **exit ceiling-hit**, list still-open findings *and* any still-open open-questions in the final report as separate groups.
-- Otherwise → N++, go back to step 1.
+Call `loop_state.evaluate_exit()` with the populated `RoundState`:
+
+```bash
+python -c "
+import sys, os
+sys.path.insert(0, '<skill-dir>/scripts')
+from loop_state import evaluate_exit, ExitReason
+
+decision = evaluate_exit(
+    state,
+    max_rounds=int(os.environ.get('ADVERSARIAL_MAX_ROUNDS', '20')),
+    cumulative_cost_usd=cumulative_cost,
+    cost_cap_usd=float(os.environ.get('ADVERSARIAL_MAX_COST_USD', '5.0')),
+)
+print(decision.reason.value, decision.needs_soft_block)
+"
+```
+
+Possible outcomes (in priority order — `evaluate_exit` evaluates them in this order and returns the first match):
+
+| `decision.reason` | When | Action |
+|---|---|---|
+| `approved` | Reviewer returned NO_FINDINGS | **Exit**: clean review, schema guarantees no open questions either |
+| `planner_locked` | Every finding this round was rejected (must be checked before `resolved` since rejections count as "decided") | **Soft-block** if open items remain; else exit |
+| `resolved` | Zero unresolved highs + zero open questions + every medium decided | **Exit**: clean by design |
+| `cost_capped` | Cumulative cost ≥ `ADVERSARIAL_MAX_COST_USD` (default $5) | **Soft-block** if `decision.needs_soft_block`; else exit |
+| `ceiling_hit` | `round_n >= ADVERSARIAL_MAX_ROUNDS` (default 20) | **Soft-block** if open items remain; else exit |
+| `no_exit` | None of the above | N++, go back to step 1 |
+
+Note: the `resolved_with_deferrals` reason is NOT returned directly by `evaluate_exit`; it is produced by calling `escalate_to_resolved_with_deferrals(decision, deferrals)` after the user completes the soft-block deferral flow described below.
+
+If `decision.needs_soft_block` is True, run the §5.4.1 soft-block flow:
+
+1. **Step 1 (action selection):** `AskUserQuestion` with three options — "Defer all (collect reasons + targets in next step)", "Continue looping despite the exit condition", "Exit anyway, accept all risk".
+2. **Step 2 (per-item collection, only on Defer):** for each open finding/open-question, `AskUserQuestion` with free-text "Other" for the deferral reason. For mediums, also collect a target version (e.g. "v2.1", "Phase X", "backlog", or free-text). Build a list of `Deferral` objects and stash them on `state.deferrals_at_exit` BEFORE re-running step 6 — the sidecar must persist the deferrals or the exit can't be audited.
+3. **Step 2 (accept_all_risk branch):** auto-populate `Deferral(item_id, severity, reason="accepted at exit", target_version="accepted-at-exit")` for every open item. The sentinel string "accepted-at-exit" satisfies the schema's medium-target non-null requirement (round-14 finding 1 of the dogfood).
+
+After collecting deferrals (either via Defer step-2 or accept_all_risk), promote the exit reason via `escalate_to_resolved_with_deferrals(decision, deferrals)` — the end report should show `resolved_with_deferrals` rather than the underlying `ceiling_hit` / `planner_locked` / `cost_capped`, since the audit trail now reflects an explicit deferral with reasons + targets.
+
+If the user picks **Continue**, do NOT exit — N++ and go back to step 1.
+
+**7a. Plan-bloat detection (§5.5; only if exit decision is "no exit yet" and round_n >= ADVERSARIAL_BLOAT_WINDOW).**
+
+```bash
+python -c "
+import sys, os
+sys.path.insert(0, '<skill-dir>/scripts')
+from loop_state import evaluate_bloat, load_sidecars
+
+sidecars = load_sidecars(slug='<slug>', version='<version>')
+verdict = evaluate_bloat(
+    sidecars=sidecars,
+    current_plan_size_chars=current_plan_size,
+    threshold=float(os.environ.get('ADVERSARIAL_BLOAT_THRESHOLD', '0.20')),
+    window=int(os.environ.get('ADVERSARIAL_BLOAT_WINDOW', '3')),
+)
+print(verdict.triggered, verdict.growth_fraction)
+"
+```
+
+If `verdict.triggered`, AskUserQuestion with three options — "Continue normally", "Switch to consistency-only mode" (next round's prompt narrows to scrub-only via `--consistency-only` on the v2 builder), "Exit now with bloat note". The mode choice persists for remaining rounds.
+
+After a non-exiting round (no exit + no bloat trigger): N++, go back to step 1.
 
 ## End report
 
-At loop exit, tell the user:
+After exit, also clean up the snapshot directory:
 
-- Final status: **approved** | **planner-locked** | **ceiling hit**
+```bash
+python -c "
+import sys
+sys.path.insert(0, '<skill-dir>/scripts')
+from loop_state import cleanup_snapshots
+n = cleanup_snapshots(slug='<slug>', version='<version>')
+print(f'cleaned {n} snapshot files from .scratch/')
+"
+```
+
+Then tell the user:
+
+- Final status (v2): **approved** | **resolved** | **resolved-with-deferrals** | **planner-locked** | **ceiling-hit** | **cost-capped**
 - Rounds run
-- Counts: total findings raised, accepted, rejected (break out user-resolved counts if non-zero)
+- Counts: total findings raised, accepted, rejected, deferred (break out user-resolved counts if non-zero)
+- Severity histogram across the full run (rendered from sidecar.stats)
+- Total cost (USD) — `cumulative_cost_usd` from the final round's sidecar
 - Path to the final plan md
-- Path to the fixes md (full transcript)
+- Path to the fixes md (full transcript) — note this is the rendered view; the JSON sidecars at `plans/fixs/<slug>-<version>-round-*.json` are the audit-trail source of truth
 
 If the loop exits at **ceiling hit** and there are still-open items, list them as two separate groups so the user can see what needs a human call outside the loop:
 
