@@ -660,15 +660,28 @@ def evaluate_exit(
         )
 
     # 3. Resolved: zero unresolved highs + zero open questions + every
-    #    medium has an Accept/Reject decision (no Uncertain remaining).
+    #    medium has an Accept/Reject decision (no Uncertain remaining) +
+    #    no accepted findings this round. The accept guard is load-bearing:
+    #    "every finding decided" includes accepts, but accepts produce plan
+    #    edits that no reviewer has seen yet. Exiting here would skip the
+    #    validation round that confirms the edits actually closed the
+    #    finding (or introduced new problems). The only safe same-round
+    #    clean exits are APPROVED (NO_FINDINGS this round) and
+    #    PLANNER_LOCKED (all rejected, no edits made). When accepts are
+    #    present we fall through to NO_EXIT and let round N+1's reviewer
+    #    deliver the verdict on the edited plan.
     if not open_highs and not open_mediums and not open_questions:
-        return ExitDecision(
-            reason=ExitReason.RESOLVED,
-            open_highs=[],
-            open_mediums=[],
-            open_questions=[],
-            needs_soft_block=False,
+        has_accepts = any(
+            d.decision in ("accept", "accept_via_user") for d in state.decisions
         )
+        if not has_accepts:
+            return ExitDecision(
+                reason=ExitReason.RESOLVED,
+                open_highs=[],
+                open_mediums=[],
+                open_questions=[],
+                needs_soft_block=False,
+            )
 
     has_open = bool(open_highs or open_mediums or open_questions)
 

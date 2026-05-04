@@ -110,15 +110,33 @@ def test_exit_planner_locked_only_with_via_user_rejects():
     assert decision.reason == ExitReason.PLANNER_LOCKED
 
 
-def test_exit_resolved_when_all_decided_no_open():
+def test_exit_no_exit_when_accepts_present_even_with_no_opens():
+    """An accepted finding produces plan edits that need round N+1 to validate.
+
+    Previously this returned RESOLVED, which exited before any reviewer
+    saw the edited plan — a silent convergence bug that let the loop stop
+    after one round even when the planner made substantive changes the
+    reviewer never re-checked.
+    """
     finding = Finding("medium", "X", "Y", "Z", "W")
     state = _state(
         review=_review(status="FINDINGS_PRESENT", findings=[finding]),
         decisions=[PlannerDecision("f_r1_1", "accept", "good catch", "edit X")],
     )
     decision = evaluate_exit(state, max_rounds=20, cumulative_cost_usd=0.0, cost_cap_usd=5.0)
-    assert decision.reason == ExitReason.RESOLVED
+    assert decision.reason == ExitReason.NO_EXIT
     assert decision.needs_soft_block is False
+
+
+def test_exit_no_exit_when_accept_via_user_present():
+    """`accept_via_user` also implies edits — same guard as `accept`."""
+    finding = Finding("high", "X", "Y", "Z", "W")
+    state = _state(
+        review=_review(status="FINDINGS_PRESENT", findings=[finding]),
+        decisions=[PlannerDecision("f_r1_1", "accept_via_user", "user said yes", "edit Y")],
+    )
+    decision = evaluate_exit(state, max_rounds=20, cumulative_cost_usd=0.0, cost_cap_usd=5.0)
+    assert decision.reason == ExitReason.NO_EXIT
 
 
 def test_exit_cost_capped_when_cost_exceeds_cap():

@@ -88,7 +88,7 @@ The skill loops until one of these exit reasons fires (priority order, per [§5.
 |---|---|
 | `approved` | Reviewer returned `NO_FINDINGS` (schema guarantees no open questions either) |
 | `planner_locked` | Every finding this round was rejected by the planner |
-| `resolved` | Zero unresolved highs + zero open questions + every medium decided |
+| `resolved` | Zero unresolved highs + zero open questions + every medium decided **and** no findings were accepted this round. Accepts produce edits that the next round's reviewer must validate, so a same-round `resolved` exit is suppressed when accepts are present — the loop continues to N+1 and converges via `approved` instead. |
 | `cost_capped` | Cumulative spend ≥ `ADVERSARIAL_MAX_COST_USD` (default `$5`) |
 | `ceiling_hit` | Round count ≥ `ADVERSARIAL_MAX_ROUNDS` (default `20`) |
 | `resolved_with_deferrals` | One of the above fired with open items, and the user explicitly deferred them via `AskUserQuestion` |
@@ -195,7 +195,7 @@ Builder emits a tighter prompt:
 
 ### Convergence: `resolved` exit
 
-When the loop hits a round where every finding is decided (Accept/Reject) and zero open questions remain, the exit gate fires `resolved` and the loop ends cleanly. The end report shows the severity trajectory across rounds, total cost, and where the plan and audit trail live.
+When the reviewer returns `NO_FINDINGS` on a plan that includes the planner's edits, the exit gate fires `approved` and the loop ends cleanly. (A same-round `resolved` exit fires only if every finding was rejected without any accepts — accepts produce edits that need a follow-up round to validate.) The end report shows the severity trajectory across rounds, total cost, and where the plan and audit trail live.
 
 ### Edge: plan-bloat warning
 

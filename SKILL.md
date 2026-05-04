@@ -415,7 +415,7 @@ Possible outcomes (in priority order — `evaluate_exit` evaluates them in this 
 |---|---|---|
 | `approved` | Reviewer returned NO_FINDINGS | **Exit**: clean review, schema guarantees no open questions either |
 | `planner_locked` | Every finding this round was rejected (must be checked before `resolved` since rejections count as "decided") | **Soft-block** if open items remain; else exit |
-| `resolved` | Zero unresolved highs + zero open questions + every medium decided | **Exit**: clean by design |
+| `resolved` | Zero unresolved highs + zero open questions + every medium decided **AND no findings were accepted this round** (accepts produce edits that need a follow-up review round to validate; this exit fires only when decisions exist but none were accepts — a narrow case in practice) | **Exit**: clean by design |
 | `cost_capped` | Cumulative cost ≥ `ADVERSARIAL_MAX_COST_USD` (default $5) | **Soft-block** if `decision.needs_soft_block`; else exit |
 | `ceiling_hit` | `round_n >= ADVERSARIAL_MAX_ROUNDS` (default 20) | **Soft-block** if open items remain; else exit |
 | `no_exit` | None of the above | N++, go back to step 1 |

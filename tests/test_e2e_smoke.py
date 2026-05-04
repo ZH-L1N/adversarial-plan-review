@@ -137,7 +137,10 @@ def test_e2e_three_findings_converges_round_2(isolated_repo):
     regenerate_fixes_md(slug=slug, version=version)
 
     decision1 = evaluate_exit(state1, max_rounds=20, cumulative_cost_usd=0.05, cost_cap_usd=5.0)
-    assert decision1.reason == ExitReason.RESOLVED  # all 3 decided, 0 open
+    # Accepts produced edits this round → must run another round so the
+    # reviewer can validate them. RESOLVED would have been a silent
+    # convergence bug (the original v2 behavior).
+    assert decision1.reason == ExitReason.NO_EXIT
 
     # Verify the fixes-md was rendered
     fixes_md = isolated_repo / "plans" / "fixs" / "v0-synth-fixes.md"
@@ -145,6 +148,24 @@ def test_e2e_three_findings_converges_round_2(isolated_repo):
     md_content = fixes_md.read_text(encoding="utf-8")
     assert "## Round 1" in md_content
     assert "**[HIGH]** [Pipeline]" in md_content
+
+    # ROUND 2 — reviewer validates the edits and returns NO_FINDINGS
+    review2 = parse_openai_response(ROUND_2_RAW, round_n=2, model="gpt-5.5")
+    state2 = RoundState(
+        round_n=2, slug=slug, version=version,
+        transport="openai", model="gpt-5.5",
+        started_at="2026-05-03T00:02:00Z", completed_at="2026-05-03T00:02:30Z",
+        reviewer_response=review2,
+        decisions=[],
+        plan_edits=[],
+        plan_content_at_end=edited,
+        baseline_plan_content=baseline_text,
+        cumulative_cost_usd=0.10,
+        duration_seconds=30.0,
+        plan_size_delta=0,
+    )
+    decision2 = evaluate_exit(state2, max_rounds=20, cumulative_cost_usd=0.10, cost_cap_usd=5.0)
+    assert decision2.reason == ExitReason.APPROVED
 
 
 def test_e2e_round_2_diff_shows_round_1_edits(isolated_repo):
