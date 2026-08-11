@@ -1,16 +1,16 @@
 ---
 name: adversarial-plan-review
-description: Run a GAN-style adversarial review loop on a plan markdown file. Claude is the planner; an independent reviewer (OpenAI Responses API with gpt-5.5 by default, or Codex CLI as legacy fallback) returns severity-tagged findings. v2 features diff-aware reviewing, severity-gated exit, JSON sidecar persistence, plan-bloat detection, and resume support. TRIGGER when the user wants to stress-test a plan with a different model, run adversarial plan review, iterate a plan until it survives discriminator critique, or says "adversarial plan review", "GAN review my plan", "codex-review my plan", or has just finished a plan draft and wants external challenge before implementation. DO NOT TRIGGER for code review, git diff review, PR review, or implementation review — for those use /codex:adversarial-review, /codex:review, or code-review:code-review. This skill operates only on plan markdown files under plans/, never on source code.
+description: Run a GAN-style adversarial review loop on a plan markdown file. Claude is the planner; an independent reviewer (OpenAI Responses API with gpt-5.6-sol by default, or Codex CLI as legacy fallback) returns severity-tagged findings. v2 features diff-aware reviewing, severity-gated exit, JSON sidecar persistence, plan-bloat detection, and resume support. TRIGGER when the user wants to stress-test a plan with a different model, run adversarial plan review, iterate a plan until it survives discriminator critique, or says "adversarial plan review", "GAN review my plan", "codex-review my plan", or has just finished a plan draft and wants external challenge before implementation. DO NOT TRIGGER for code review, git diff review, PR review, or implementation review — for those use /codex:adversarial-review, /codex:review, or code-review:code-review. This skill operates only on plan markdown files under plans/, never on source code.
 ---
 
 # Adversarial Plan Review Loop
 
 Two roles, two different models, one loop.
 
-- **Reviewer** — auto-detected per Setup step 2. Default is **OpenAI Responses API** (`gpt-5.5`) when `OPENAI_API_KEY` is set; falls back to **Codex CLI** (`gpt-5.5` via ChatGPT auth) otherwise. Adversarial discriminator: tries to break confidence in the plan. The OpenAI path returns schema-validated, severity-tagged findings (`high|medium|low`); the Codex path returns prose findings with severity inferred via keyword heuristic.
+- **Reviewer** — auto-detected per Setup step 2. Default is **OpenAI Responses API** (`gpt-5.6-sol`) when `OPENAI_API_KEY` is set; falls back to **Codex CLI** (`gpt-5.6-sol` via ChatGPT auth) otherwise. Adversarial discriminator: tries to break confidence in the plan. The OpenAI path returns schema-validated, severity-tagged findings (`high|medium|low`); the Codex path returns prose findings with severity inferred via keyword heuristic.
 - **Planner** — You (Claude). Go through each finding, accept or reject with concrete reasoning, edit the plan for accepted findings. The split between writer and reviewer is the whole point: it prevents the planner from rationalizing its own blind spots.
 
-**v2 status (alpha):** Phases 1+2 are live (transport abstraction + structured outputs with severity tags). Phases 3+4 (diff-aware reviewing, severity-gated exit, plan-bloat detection, resume support) are in-flight. See `plans/v2-plan.md` for the full design.
+**v2 status:** Phases 1–4 are live (transport abstraction, structured outputs with severity tags, diff-aware reviewing, severity-gated exit, plan-bloat detection, resume support). See `plans/v2-plan.md` in this skill's own repo for the full design.
 
 ## Why this shape
 
@@ -32,6 +32,8 @@ If the output shows any modified, added, or deleted files **outside** `plans/` (
 
 > "Working tree has uncommitted changes outside `plans/`. Commit or stash them before running the adversarial plan review so code changes can't be accidentally swept into the loop."
 
+Exemptions: this skill's own `.scratch/` snapshot directory (leftover snapshots from an interrupted run are expected on resume — not a dirty tree) and the `.env`/`.gitignore` writes made by its own first-run branch (see Allowed writes below).
+
 If `git` is not available or this is not a git repo, skip the check and warn the user that the pre-flight guard is disabled.
 
 ### Allowed writes (hard boundary)
@@ -41,6 +43,7 @@ During the entire loop, the only files you may create or edit are:
 - `plans/<version>-<slug>.md` — the plan itself
 - `plans/fixs/<version>-<slug>-fixes.md` — the round log
 - `plans/fixs/` directory (create if missing)
+- `.scratch/<version>-<slug>-plan-snapshot-r*.md` — round baseline snapshots (cleaned up at exit)
 
 **First-run UX exceptions** (Setup step 2 only, not during the loop): when a user supplies an OpenAI API key via `AskUserQuestion`, `first_run.save_openai_key_to_env()` may also write to:
 
@@ -65,23 +68,29 @@ Commits are the user's decision after the loop exits. The fixes md is already th
 
 Stop. Re-read this section. Report what you were about to do, and ask the user what to do instead. Do not silently proceed.
 
-## Termination (whichever comes first)
+## Termination
 
-1. Planner rejects **every** finding in a round → **planner-locked**
-2. Reviewer returns exactly `NO FINDINGS` → **approved**
-3. Round 10 reached → **ceiling hit**, report still-open findings
+Exit reasons and their gates are defined by step 7's `evaluate_exit` table
+below: `approved`, `resolved`, `resolved_with_deferrals`, `planner_locked`,
+`ceiling_hit` (`ADVERSARIAL_MAX_ROUNDS`, default 20), `cost_capped`.
 
 ## Setup
 
-> **v2 (alpha):** Phases 1+2 of the v2 plan are live. Transport now auto-detects between OpenAI Responses API (`gpt-5.5`, default if `OPENAI_API_KEY` is set) and Codex CLI (legacy fallback). Findings are tagged with severity (`high|medium|low`) when the OpenAI path is used. Loop termination still follows v1 rules; severity-gated exit lands in Phase 4.
+> **v2:** Transport auto-detects between OpenAI Responses API (`gpt-5.6-sol`, default if `OPENAI_API_KEY` is set) and Codex CLI (legacy fallback). Findings are tagged with severity (`high|medium|low`) when the OpenAI path is used. Loop termination is severity-gated via step 7's `evaluate_exit`.
 
-1. **Pre-flight check.** Run `git status --porcelain` and refuse to start if any modified/added/deleted files exist outside `plans/`.
+1. **Pre-flight check.** Run `git status --porcelain` and refuse to start if any modified/added/deleted files exist outside `plans/`. Exemptions: this skill's own `.scratch/` snapshot directory (leftover snapshots from an interrupted run are expected on resume — not a dirty tree) and the `.env`/`.gitignore` writes made by its own first-run branch.
 
 2. **Transport check + first-run UX (v2 step 2 of §5.0a in plans/v2-plan.md).** Run:
 
    ```bash
-   python "<skill-dir>/scripts/first_run.py" --check
+   uv run --no-project --with openai python "<skill-dir>/scripts/first_run.py" --check
    ```
+
+   Run every other `python` snippet in this skill the same way
+   (`uv run --no-project --with openai python …`): bare `python` may lack
+   the `openai` package, which the reviewer imports lazily — so `--check`
+   alone cannot detect its absence, and `--no-project` keeps `uv` from
+   trying to sync the target repo's own environment first.
 
    If exit code 0, the script prints which transport will be used (`openai` or `codex`); proceed to step 3.
 
@@ -107,6 +116,8 @@ Stop. Re-read this section. Report what you were about to do, and ask the user w
 
 3. **Interactively ask the user** for the plan **slug** and **version** (e.g., `optical-lcoe`, `v0.0.5`). Always ask — do not guess from context, do not accept args. Deliberate paths prevent accidental overwrites.
 
+   **Orchestrated mode exception:** when this skill is invoked by the `/ship` orchestrator with an explicit slug, version, and rounds ceiling (`ADVERSARIAL_MAX_ROUNDS`), skip this interactive ask and use the supplied values verbatim. Resume detection (step 6) also auto-selects **Resume** when prior sidecars exist instead of asking. The step-7a plan-bloat ask is likewise skipped: on a bloat trigger, auto-select **Switch to consistency-only mode** and record the choice in the round's JSON sidecar and the End report (not the fixes md body — `regenerate_fixes_md` rewrites it each round). Exit-time soft-blocks (step 7) are likewise auto-resolved per their own orchestrated-mode notes. Everything else — scope boundary, git prohibition, step-4a uncertainty consultations — is unchanged.
+
 4. Resolve paths in the user's current working directory:
    - Plan md: `plans/<version>-<slug>.md` — **must already exist**. If missing, fail fast and tell the user to draft it first. This skill does not create plans from scratch.
    - Fixes md: `plans/fixs/<version>-<slug>-fixes.md` — create with the header below if missing. Append if resuming.
@@ -125,7 +136,7 @@ Stop. Re-read this section. Report what you were about to do, and ask the user w
    "
    ```
 
-   - If `has_prior_run=True`, use `AskUserQuestion` to ask the user: **(a)** Resume from round N+1, **(b)** Start over (destructive — see §5.0 destructive ops table; lists files to delete before confirmation), or **(c)** Cancel.
+   - If `has_prior_run=True`, use `AskUserQuestion` to ask the user: **(a)** Resume from round N+1, **(b)** Start over (destructive — see §5.0 destructive ops table; lists files to delete before confirmation), or **(c)** Cancel — **unless in orchestrated mode** (invoked by `/ship`), in which case do not ask: auto-select **Resume**.
    - If `has_prior_run=False`, take the initial baseline snapshot:
 
      ```bash
@@ -149,7 +160,7 @@ The header is rendered by `scripts/render_markdown.py` from the round-1 sidecar 
 
 - Plan: `plans/<version>-<slug>.md`
 - Started: <ISO 8601 timestamp>
-- Reviewer: <"OpenAI Responses API (gpt-5.5)" | "Codex CLI (gpt-5.5)">
+- Reviewer: <"OpenAI Responses API (gpt-5.6-sol)" | "Codex CLI (gpt-5.6-sol)">
 - Planner: Claude
 - Termination rules: severity-gated exit | NO FINDINGS | ceiling hit | planner-locked | cost-capped (v2; see plans/v2-plan.md §5.4)
 ```
@@ -216,7 +227,7 @@ sys.path.insert(0, '<skill-dir>/scripts')
 from reviewer import invoke_reviewer
 
 SLUG, VERSION, ROUND_N = '<slug>', '<version>', N
-fixes_path = Path(f'plans/fixs/{SLUG}-{VERSION}-fixes.md')
+fixes_path = Path(f'plans/fixs/{VERSION}-{SLUG}-fixes.md')
 
 result = invoke_reviewer(open('/tmp/round-N-prompt.txt').read(), round_n=ROUND_N)
 
@@ -247,7 +258,7 @@ print(json.dumps({
 
 The reviewer module:
 - Picks transport via env (`ADVERSARIAL_TRANSPORT`, then `OPENAI_API_KEY`, then Codex availability)
-- For OpenAI: uses Responses API with strict JSON schema (`gpt-5.5` default), guaranteeing severity-tagged findings
+- For OpenAI: uses Responses API with strict JSON schema (`gpt-5.6-sol` default), guaranteeing severity-tagged findings
 - For Codex: pipes prompt via stdin (Windows-safe; bypasses argv length limits), then runs the keyword-based severity heuristic
 - Returns a normalized `ReviewResult` with `status`, `findings`, `open_questions`, transport metadata, and usage figures
 
@@ -422,7 +433,7 @@ Possible outcomes (in priority order — `evaluate_exit` evaluates them in this 
 
 Note: the `resolved_with_deferrals` reason is NOT returned directly by `evaluate_exit`; it is produced by calling `escalate_to_resolved_with_deferrals(decision, deferrals)` after the user completes the soft-block deferral flow described below.
 
-If `decision.needs_soft_block` is True, run the §5.4.1 soft-block flow:
+If `decision.needs_soft_block` is True, run the §5.4.1 soft-block flow — **unless in orchestrated mode** (invoked by `/ship`), in which case do not ask: any open HIGH finding → exit with the underlying reason (`ceiling_hit` / `cost_capped` / `planner_locked`) and report the open highs to the orchestrator (it stops its pipeline); otherwise auto-populate `Deferral(item_id, severity, reason="auto-deferred by /ship at exit", target_version="backlog")` for every open medium/low item, stash them on `state.deferrals_at_exit`, re-run step 6 persistence, and promote via `escalate_to_resolved_with_deferrals(decision, deferrals)`. Interactive invocations proceed with the flow below:
 
 1. **Step 1 (action selection):** `AskUserQuestion` with three options — "Defer all (collect reasons + targets in next step)", "Continue looping despite the exit condition", "Exit anyway, accept all risk".
 2. **Step 2 (per-item collection, only on Defer):** for each open finding/open-question, `AskUserQuestion` with free-text "Other" for the deferral reason. For mediums, also collect a target version (e.g. "v2.1", "Phase X", "backlog", or free-text). Build a list of `Deferral` objects and stash them on `state.deferrals_at_exit` BEFORE re-running step 6 — the sidecar must persist the deferrals or the exit can't be audited.
@@ -451,7 +462,7 @@ print(verdict.triggered, verdict.growth_fraction)
 "
 ```
 
-If `verdict.triggered`, AskUserQuestion with three options — "Continue normally", "Switch to consistency-only mode" (next round's prompt narrows to scrub-only via `--consistency-only` on the v2 builder), "Exit now with bloat note". The mode choice persists for remaining rounds.
+If `verdict.triggered`, AskUserQuestion with three options — "Continue normally", "Switch to consistency-only mode" (next round's prompt narrows to scrub-only via `--consistency-only` on the v2 builder), "Exit now with bloat note" — **unless in orchestrated mode** (invoked by `/ship`), in which case do not ask: auto-select "Switch to consistency-only mode", record the choice in the round's sidecar and End report, and continue. The mode choice persists for remaining rounds.
 
 After a non-exiting round (no exit + no bloat trigger): N++, go back to step 1.
 
