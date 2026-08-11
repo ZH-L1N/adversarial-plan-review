@@ -1,0 +1,73 @@
+{
+  "plan": "plans/claude-transport-plan.md",
+  "round": 1,
+  "reviewer": "claude-opus-5 (calibrated single round \u2014 dogfood of the discipline block this plan ships)",
+  "date": "2026-08-11",
+  "verdict": "revise",
+  "counts": {
+    "HIGH": 4,
+    "MEDIUM": 4,
+    "LOW": 0
+  },
+  "suppressed_below_bar": 6,
+  "cli_probes": "claude 2.1.227: flags verified incl. undocumented --max-turns and native --json-schema; envelope fields incl. modelUsage.canonicalModel/permission_denials; allowedTools containment disproven under bypassPermissions; subscription runs report non-zero total_cost_usd; ~37k ambient cache tokens from repo cwd",
+  "dispositions": [
+    {
+      "id": "R1-H1",
+      "severity": "HIGH",
+      "title": "--allowedTools does not contain: ~/.claude/settings.json bypassPermissions is inherited by -p children (probe: Read/Grep/Glob-only reviewer wrote a file to disk)",
+      "disposition": "accepted",
+      "resolution": "Containment moved from prose to flags: --setting-sources '' + --strict-mcp-config + --tools + --allowedTools + --disallowedTools write/git/rm floor; smoke asserts clean git status after a live round."
+    },
+    {
+      "id": "R1-H2",
+      "severity": "HIGH",
+      "title": "sidecar_schema.json transport enum lacks 'claude' -> first sidecar write hard-fails wherever jsonschema is installed",
+      "disposition": "accepted",
+      "resolution": "Enum widened (+schema minor bump), test added, test gate now runs --with jsonschema."
+    },
+    {
+      "id": "R1-H3",
+      "severity": "HIGH",
+      "title": "Prompt is built before transport is known -> quota fallback would send Claude an OpenAI-calibrated prompt",
+      "disposition": "accepted",
+      "resolution": "Typed QuotaExhaustedError; the orchestration catches it, REBUILDS the prompt with transport=claude, re-invokes explicitly. No silent in-module fallback."
+    },
+    {
+      "id": "R1-H4",
+      "severity": "HIGH",
+      "title": "--max-turns 60 < observed max 74; error_max_turns envelope has result:null and would classify permanent, discarding a paid round",
+      "disposition": "accepted",
+      "resolution": "Default 120; --max-budget-usd 5.0 as primary documented guard; error_max_turns -> transient TransportError naming the budget; is_error/subtype checked before result; undocumented-flag canary test."
+    },
+    {
+      "id": "R1-M1",
+      "severity": "MEDIUM",
+      "title": "Drift is ~174 lines incl. a fixes-md filename BUG FIX ({SLUG}-{VERSION} vs loop_state's {VERSION}-{SLUG}) and the /ship orchestrated-mode block \u2014 not 'mechanical model-name updates'",
+      "disposition": "accepted",
+      "resolution": "Task 0 rewritten enumerating all six items, split into two commits."
+    },
+    {
+      "id": "R1-M2",
+      "severity": "MEDIUM",
+      "title": "Cost accounting wrong 3 ways: cache tokens excluded (~4000x undercount), PRICING symbol doesn't exist (_DEFAULT_RATES), 'opus' alias never matches claude-opus-5 row; total_cost_usd is non-zero on subscription",
+      "disposition": "accepted",
+      "resolution": "total_cost_usd used unconditionally (estimate only when absent, keyed on modelUsage canonicalModel); tokens_input sums all three input fields; OPENAI_* overrides isolated from claude rows; open question 3 declared moot."
+    },
+    {
+      "id": "R1-M3",
+      "severity": "MEDIUM",
+      "title": "Existing test asserts the old detect_transport error message ('anthropic' input); default-model test not named in Task 0",
+      "disposition": "accepted",
+      "resolution": "Task 5 updates the test (input -> 'gemini', new message) + adds ADVERSARIAL_TRANSPORT=anthropic rejects; Task 0 names test_default_openai_model_is_gpt_55."
+    },
+    {
+      "id": "R1-M4",
+      "severity": "MEDIUM",
+      "title": "Reviewer child inherits reviewed repo's CLAUDE.md/skills/hooks/MCP (~37k cache tokens ambient) \u2014 contaminates discriminator independence and cost",
+      "disposition": "accepted",
+      "resolution": "Isolation contract: --setting-sources '' + --strict-mcp-config; role travels in the prompt; --bare rejected (breaks subscription auth); CLAUDE.md declared contamination, not context."
+    }
+  ],
+  "open": []
+}

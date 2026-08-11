@@ -1,13 +1,13 @@
 ---
 name: adversarial-plan-review
-description: Run a GAN-style adversarial review loop on a plan markdown file. Claude is the planner; an independent reviewer (OpenAI Responses API with gpt-5.6-sol by default, or Codex CLI as legacy fallback) returns severity-tagged findings. v2 features diff-aware reviewing, severity-gated exit, JSON sidecar persistence, plan-bloat detection, and resume support. TRIGGER when the user wants to stress-test a plan with a different model, run adversarial plan review, iterate a plan until it survives discriminator critique, or says "adversarial plan review", "GAN review my plan", "codex-review my plan", or has just finished a plan draft and wants external challenge before implementation. DO NOT TRIGGER for code review, git diff review, PR review, or implementation review — for those use /codex:adversarial-review, /codex:review, or code-review:code-review. This skill operates only on plan markdown files under plans/, never on source code.
+description: Run a GAN-style adversarial review loop on a plan markdown file. Claude is the planner; an independent reviewer (OpenAI Responses API with gpt-5.6-sol by default, the headless Claude Code CLI as the repo-verifying auto-fallback — including when OpenAI quota runs out mid-loop — or Codex CLI as legacy fallback) returns severity-tagged findings. v2 features diff-aware reviewing, severity-gated exit, JSON sidecar persistence, plan-bloat detection, and resume support. TRIGGER when the user wants to stress-test a plan with a different model, run adversarial plan review, iterate a plan until it survives discriminator critique, or says "adversarial plan review", "GAN review my plan", "codex-review my plan", or has just finished a plan draft and wants external challenge before implementation. DO NOT TRIGGER for code review, git diff review, PR review, or implementation review — for those use /codex:adversarial-review, /codex:review, or code-review:code-review. This skill operates only on plan markdown files under plans/, never on source code.
 ---
 
 # Adversarial Plan Review Loop
 
 Two roles, two different models, one loop.
 
-- **Reviewer** — auto-detected per Setup step 2. Default is **OpenAI Responses API** (`gpt-5.6-sol`) when `OPENAI_API_KEY` is set; falls back to **Codex CLI** (`gpt-5.6-sol` via ChatGPT auth) otherwise. Adversarial discriminator: tries to break confidence in the plan. The OpenAI path returns schema-validated, severity-tagged findings (`high|medium|low`); the Codex path returns prose findings with severity inferred via keyword heuristic.
+- **Reviewer** — auto-detected per Setup step 2. Default is **OpenAI Responses API** (`gpt-5.6-sol`) when `OPENAI_API_KEY` is set; otherwise the **Claude Code CLI** (`claude -p`, `opus`); otherwise **Codex CLI** (`gpt-5.6-sol` via ChatGPT auth). Adversarial discriminator: tries to break confidence in the plan. The OpenAI path returns schema-validated, severity-tagged findings (`high|medium|low`); the Claude path returns the same JSON validated locally (retry-once on malformed output) and additionally verifies the plan against the repo; the Codex path returns prose findings with severity inferred via keyword heuristic.
 - **Planner** — You (Claude). Go through each finding, accept or reject with concrete reasoning, edit the plan for accepted findings. The split between writer and reviewer is the whole point: it prevents the planner from rationalizing its own blind spots.
 
 **v2 status:** Phases 1–4 are live (transport abstraction, structured outputs with severity tags, diff-aware reviewing, severity-gated exit, plan-bloat detection, resume support). See `plans/v2-plan.md` in this skill's own repo for the full design.
@@ -74,9 +74,39 @@ Exit reasons and their gates are defined by step 7's `evaluate_exit` table
 below: `approved`, `resolved`, `resolved_with_deferrals`, `planner_locked`,
 `ceiling_hit` (`ADVERSARIAL_MAX_ROUNDS`, default 20), `cost_capped`.
 
+## Reviewer transports
+
+| Transport | Auth | Structured output | Repo access | Model default |
+|---|---|---|---|---|
+| `openai` | `OPENAI_API_KEY` | Strict JSON schema, server-enforced | No — text only | `gpt-5.6-sol` |
+| `claude` | Claude Code login (no key) | JSON-in-prompt + validate/retry | **Yes — settings-isolated** | `opus` (alias; resolved id recorded) |
+| `codex` | `codex login` (ChatGPT auth) | Prose + keyword severity heuristic | No — text only | `gpt-5.6-sol` |
+
+**Detection order** (`reviewer.detect_transport`): explicit `ADVERSARIAL_TRANSPORT` → `OPENAI_API_KEY` set → `claude` on PATH → `codex` on PATH → `TransportUnavailableError` (first-run UX). Valid explicit values are exactly `openai`, `codex`, `claude`; `anthropic` is **not** an alias and raises.
+
+### Containment contract for the `claude` transport
+
+The claude reviewer is a real agent with tools, running inside the user's repo. Its boundaries are enforced by **flags, not prose** — `reviewer._invoke_claude` always passes `--setting-sources ""`, `--strict-mcp-config`, `--tools`, `--allowedTools`, a `--disallowedTools` write/git/rm floor, `--max-turns`, and `--max-budget-usd`.
+
+**Do not weaken this to a prompt instruction.** It was probed on `claude 2.1.227`: with a user-level `permissions.defaultMode: bypassPermissions` in `~/.claude/settings.json`, a `-p` child granted **only** `Read`/`Grep`/`Glob` still executed `Write` and created a file. `--allowedTools` alone does not contain — the inherited settings out-rank it. Adding `--setting-sources ""` turned the same attempt into a `permission_denials` entry with no file on disk. Settings isolation also drops the reviewed repo's ambient `CLAUDE.md`/skills/hooks (~37k cache tokens on a one-word probe), which is what keeps the reviewer independent of the priors it is supposed to challenge.
+
+The scope rules in "Scope and safety" above still apply to the reviewer subprocess — the flags are how they are made true, not a replacement for them.
+
+### Calibration for the `claude` transport
+
+`build_reviewer_prompt_v2` appends three claude-only blocks (`transport="claude"`); the openai/codex prompts stay byte-identical.
+
+- `<repo_verification>` — round 1: open every file the plan cites, check named fixtures/helpers/config keys exist, lint-probe embedded code, verify library versions; repo claims need personally-verified `file:line` or probe-output evidence; clean up scratch files, never modify tracked files, never run git write commands. Rounds ≥ 2: verify prior-round resolutions in the diff, then hunt only for new implementation-breaking defects — no full re-sweep.
+- `<finding_discipline>` — ≤ 8 findings ranked by impact, ≤ 3 `low`, everything below the bar collapsed into a `suppressed: N below-bar observations` line. Repo access is the capability worth keeping; volume is the failure mode being imported against (12 round-1 findings vs GPT's historical 3–6).
+- `<output_format>` — the JSON contract, **derived from `REVIEW_SCHEMA` at import time** so it cannot drift from the validator: exactly one JSON object, no fences, no prose except the trailing `suppressed:` line; the top-level keys and each `findings[]` item's fields with their types, enums, and `additionalProperties: false` ("NO other keys") semantics; plus the cross-field invariants. The openai path gets this enforced server-side by strict structured outputs — the CLI has no enforcement at all, so an unstated contract meant every round rode on `parse_claude_response` guessing.
+
+### Quota fallback (openai → claude)
+
+`invoke_reviewer` raises `QuotaExhaustedError` (a `TransportError`) when the OpenAI account is out of quota/credit, and does **not** fall back on its own — the prompt in hand was built for the openai calibration. The orchestration owns the switch; see Loop step 2.
+
 ## Setup
 
-> **v2:** Transport auto-detects between OpenAI Responses API (`gpt-5.6-sol`, default if `OPENAI_API_KEY` is set) and Codex CLI (legacy fallback). Findings are tagged with severity (`high|medium|low`) when the OpenAI path is used. Loop termination is severity-gated via step 7's `evaluate_exit`.
+> **v2:** Transport auto-detects between OpenAI Responses API (`gpt-5.6-sol`, default if `OPENAI_API_KEY` is set), the Claude Code CLI (`claude -p`, repo-verifying fallback), and Codex CLI (legacy fallback). Findings are tagged with severity (`high|medium|low`) on the OpenAI and Claude paths. Loop termination is severity-gated via step 7's `evaluate_exit`.
 
 1. **Pre-flight check.** Run `git status --porcelain` and refuse to start if any modified/added/deleted files exist outside `plans/`. Exemptions: this skill's own `.scratch/` snapshot directory (leftover snapshots from an interrupted run are expected on resume — not a dirty tree) and the `.env`/`.gitignore` writes made by its own first-run branch.
 
@@ -92,7 +122,7 @@ below: `approved`, `resolved`, `resolved_with_deferrals`, `planner_locked`,
    alone cannot detect its absence, and `--no-project` keeps `uv` from
    trying to sync the target repo's own environment first.
 
-   If exit code 0, the script prints which transport will be used (`openai` or `codex`); proceed to step 3.
+   If exit code 0, the script prints which transport will be used (`openai`, `claude` or `codex`) plus a `transports available:` line listing every one it found; **record the winning name — the prompt builder and the quota fallback in Loop steps 1–2 both need it.** Proceed to step 3.
 
    If exit code 2, no transport is configured. Use `AskUserQuestion` to ask the user how to proceed:
 
@@ -110,9 +140,11 @@ below: `approved`, `resolved`, `resolved_with_deferrals`, `planner_locked`,
 
      Then re-run `first_run.py --check`. It should now report `transport ready: openai`.
 
-   - **Option B — "I have Codex CLI installed":** run `/codex:setup` and re-run the check.
+   - **Option B — "Use my Claude Code login (no API key)":** confirm `claude` is on PATH (`command -v claude`) and re-run the check; it should report `transport ready: claude`. Nothing to configure — the CLI uses the user's existing Claude Code auth. Mention that this reviewer *reads the repo* (settings-isolated, no writes to tracked files) so it can verify the plan's claims.
 
-   - **Option C — "I need help setting one up":** print `setup_guide_text()` from `first_run.py` and exit; the user configures and re-invokes the skill.
+   - **Option C — "I have Codex CLI installed":** run `/codex:setup` and re-run the check.
+
+   - **Option D — "I need help setting one up":** print `setup_guide_text()` from `first_run.py` and exit; the user configures and re-invokes the skill.
 
 3. **Interactively ask the user** for the plan **slug** and **version** (e.g., `optical-lcoe`, `v0.0.5`). Always ask — do not guess from context, do not accept args. Deliberate paths prevent accidental overwrites.
 
@@ -173,6 +205,8 @@ The header is rendered by `scripts/render_markdown.py` from the round-1 sidecar 
 
 Locate this skill's directory (the folder containing this SKILL.md). Use the diff-aware v2 builder (`build_reviewer_prompt_v2.py`); the v1 builder is kept only for fallback debugging.
 
+Pass the **active transport** (the name Setup step 2 reported) via `--transport`: it selects the reviewer calibration. Omitting it silently builds the openai prompt, which on a claude round means no repo-verification and no finding caps.
+
 For round 1:
 
 ```bash
@@ -181,6 +215,7 @@ python "<skill-dir>/scripts/build_reviewer_prompt_v2.py" \
   --slug "<slug>" \
   --version "<version>" \
   --round 1 \
+  --transport "$TRANSPORT" \
   > /tmp/round-1-prompt.txt
 ```
 
@@ -209,6 +244,7 @@ python "<skill-dir>/scripts/build_reviewer_prompt_v2.py" \
   $(test "$RECOVERED" = "True" && echo "--diff-recovered-from-git") \
   $(test "$CONSISTENCY_ONLY" = "True" && echo "--consistency-only") \
   --cumulative-cost-usd "$CUMULATIVE_COST" \
+  --transport "$TRANSPORT" \
   > /tmp/round-N-prompt.txt
 ```
 
@@ -216,20 +252,47 @@ The builder emits a richer prompt with prior-rounds summary, accepted findings t
 
 **2. Invoke the reviewer (foreground, read-only).**
 
-The transport (`openai` or `codex`) is auto-detected at skill start (Setup step 2). Use `scripts/reviewer.py` regardless of which transport — it abstracts the difference:
+The transport (`openai`, `claude` or `codex`) is auto-detected at skill start (Setup step 2). Use `scripts/reviewer.py` regardless of which transport — it abstracts the difference:
 
 ```bash
 # in a small inline Python snippet you run via Bash, after building the prompt above
 python -c "
-import sys, json, re
+import os, sys, json, re, subprocess
 from pathlib import Path
 sys.path.insert(0, '<skill-dir>/scripts')
-from reviewer import invoke_reviewer
+from reviewer import (
+    QuotaExhaustedError, TransportSelection, _is_claude_cli_available,
+    detect_transport, invoke_reviewer,
+)
 
 SLUG, VERSION, ROUND_N = '<slug>', '<version>', N
+SKILL_DIR = '<skill-dir>'
 fixes_path = Path(f'plans/fixs/{VERSION}-{SLUG}-fixes.md')
 
-result = invoke_reviewer(open('/tmp/round-N-prompt.txt').read(), round_n=ROUND_N)
+prompt_path = Path('/tmp/round-N-prompt.txt')
+selection = detect_transport()
+explicit = (os.environ.get('ADVERSARIAL_TRANSPORT') or '').strip().lower()
+
+try:
+    result = invoke_reviewer(prompt_path.read_text(encoding='utf-8'), round_n=ROUND_N,
+                             transport=selection, repo_root=os.getcwd())
+except QuotaExhaustedError:
+    # Quota fallback: auto-detected openai only. An EXPLICIT selection surfaces.
+    if explicit or not _is_claude_cli_available(dict(os.environ)):
+        raise
+    print('transport fallback: openai quota exhausted -> claude', file=sys.stderr)
+    # Rebuild the prompt for the CLAUDE calibration — the one we just used has
+    # no <repo_verification>/<finding_discipline>/<output_format> blocks.
+    subprocess.run([sys.executable, f'{SKILL_DIR}/scripts/build_reviewer_prompt_v2.py',
+                    '--plan-file', f'plans/{VERSION}-{SLUG}.md', '--slug', SLUG,
+                    '--version', VERSION, '--round', str(ROUND_N),
+                    '--transport', 'claude',
+                    # plus the same --diff-file/--consistency-only/--cumulative-cost-usd
+                    # arguments step 1 used for this round, when ROUND_N > 1
+                    ], stdout=prompt_path.open('w', encoding='utf-8'), check=True)
+    result = invoke_reviewer(prompt_path.read_text(encoding='utf-8'), round_n=ROUND_N,
+                             transport=TransportSelection('claude', 'openai quota exhausted'),
+                             repo_root=os.getcwd())
 
 # Compute cumulative cost from prior round-stats blocks in the fixes-md.
 # (Phase 4 will replace this with sidecar-based recovery.)
@@ -257,10 +320,13 @@ print(json.dumps({
 ```
 
 The reviewer module:
-- Picks transport via env (`ADVERSARIAL_TRANSPORT`, then `OPENAI_API_KEY`, then Codex availability)
+- Picks transport via env (`ADVERSARIAL_TRANSPORT`, then `OPENAI_API_KEY`, then Claude CLI, then Codex availability)
 - For OpenAI: uses Responses API with strict JSON schema (`gpt-5.6-sol` default), guaranteeing severity-tagged findings
+- For Claude: runs `claude -p --output-format json` with the containment flags above, prompt over stdin, `cwd=repo_root` so the repo-verification pass can read the plan's repo; checks `is_error`/`subtype` **before** touching `result` (null on errors), records `total_cost_usd` verbatim, and sums the cache token fields into `tokens_input`
 - For Codex: pipes prompt via stdin (Windows-safe; bypasses argv length limits), then runs the keyword-based severity heuristic
-- Returns a normalized `ReviewResult` with `status`, `findings`, `open_questions`, transport metadata, and usage figures
+- Returns a normalized `ReviewResult` with `status`, `findings`, `open_questions`, transport metadata, and usage figures. **The sidecar records the transport/model that actually ran** — after a quota fallback that is `claude` + the resolved model id, not the openai selection you started with
+
+Retry policy: a `TransportError` with `is_transient=True` gets one retry (D20). That covers a claude round truncated by our own `--max-turns`/`--max-budget-usd` guard — a truncation is not a failure, but two in a row is an operator problem (raise the cap). `QuotaExhaustedError` is never retried; it is the transport switch above.
 
 **3. Interpret the result.**
 
@@ -388,12 +454,13 @@ OPEN QUESTIONS:
 
 ### Reviewer raw response
 ```text
-<verbatim raw_response_text from the ReviewResult — JSON for OpenAI path, prose for Codex>
+<verbatim raw_response_text from the ReviewResult — JSON for OpenAI, JSON (possibly fenced / prose-wrapped, incl. any `suppressed: N below-bar observations` line) for Claude, prose for Codex>
 ```
 ````
 
 **Severity prefix rules:**
 - OpenAI transport: severity comes directly from the schema-validated response (`high|medium|low`)
+- Claude transport: severity comes from the reviewer's own JSON, locally validated against the same schema — an out-of-enum severity is a `ReviewSchemaError` and gets one retry, never a silent coercion
 - Codex transport: severity is inferred via keyword heuristic in `parse_review.py` (silent/data-loss/security → high; gap/ambiguous/missing-test → medium; otherwise low). Documented as best-effort.
 
 **Open-question IDs (`oq_rN_<index>`)** are assigned post-parse by `assign_open_question_ids()` in `parse_review.py`. They are stable within a round and unique across rounds. Reference these IDs in the `User resolution` section when a question gets answered.
