@@ -3,7 +3,7 @@
 Two paths converge on the same `ReviewResult` shape (defined in
 `parse_review.py`):
 
-- **OpenAI Responses API** (`gpt-5.5` by default) — JSON schema enforcement
+- **OpenAI Responses API** (`gpt-5.6-sol` by default) — JSON schema enforcement
   via the strict structured-output mode. The recommended path.
 - **Codex CLI** (`codex-companion.mjs task`) — v1-compatible prose path used
   when no `OPENAI_API_KEY` is configured. Severity is inferred via keyword
@@ -40,8 +40,8 @@ from cost_tracker import estimate_cost_usd
 # the skill's .env file.
 load_local_env()
 
-DEFAULT_OPENAI_MODEL = "gpt-5.5"
-DEFAULT_CODEX_MODEL = "gpt-5.5"
+DEFAULT_OPENAI_MODEL = "gpt-5.6-sol"
+DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
 DEFAULT_MAX_OUTPUT_TOKENS = 8000
 
 
@@ -130,8 +130,11 @@ def _is_codex_cli_available(env: dict[str, str]) -> bool:
     """
     path_env = env.get("PATH", "")
     pathext = env.get("PATHEXT", "")
+    # PATHEXT is a Windows construct and is ALWAYS ';'-separated — splitting on
+    # os.pathsep broke the hermetic env-injection contract on POSIX hosts (':'),
+    # where an injected Windows-style PATHEXT became one unsplittable token.
     extensions = (
-        [""] + [ext.lower() for ext in pathext.split(os.pathsep) if ext]
+        [""] + [ext.lower() for ext in pathext.split(";") if ext]
         if pathext
         else [""]
     )

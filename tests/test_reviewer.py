@@ -169,9 +169,9 @@ def test_resolve_codex_command_neither_path_nor_companion(monkeypatch):
 # --- Default model -----------------------------------------------------------
 
 
-def test_default_openai_model_is_gpt_55():
-    """v2 default per §5.1.1 / D3."""
-    assert DEFAULT_OPENAI_MODEL == "gpt-5.5"
+def test_default_openai_model_is_gpt_56_sol():
+    """July 2026 flagship; bumped from the v2-launch gpt-5.5 default (deployed 2026-08)."""
+    assert DEFAULT_OPENAI_MODEL == "gpt-5.6-sol"
 
 
 # --- TransportSelection ------------------------------------------------------

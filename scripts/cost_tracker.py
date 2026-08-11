@@ -4,8 +4,8 @@ Phase 1+2 scope (per v2-plan §7 Milestone A): tracking only. Cost-cap pause
 gating lands in Phase 4 with the rest of `loop_state.py`.
 
 Cost rates are last-known per the v2-plan model table (cached 2026-04-15) plus
-the gpt-5.5 launch in April 2026. Operators can override via env vars if their
-billing tier differs.
+the gpt-5.5 launch in April 2026 and the gpt-5.6 family launch in July 2026.
+Operators can override via env vars if their billing tier differs.
 """
 from __future__ import annotations
 
@@ -15,10 +15,17 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-# Per-1M-token rates in USD. Source: v2-plan §3 + April 2026 gpt-5.5 release notes.
-# Operators on different tiers can override via OPENAI_INPUT_USD_PER_1M /
-# OPENAI_OUTPUT_USD_PER_1M env vars without code changes.
+# Per-1M-token rates in USD. Source: v2-plan §3 + April 2026 gpt-5.5 release
+# notes + July 2026 gpt-5.6 launch pricing. Operators on different tiers can
+# override via OPENAI_INPUT_USD_PER_1M / OPENAI_OUTPUT_USD_PER_1M env vars
+# without code changes.
+# Note: gpt-5.6 charges 2x input / 1.5x output on requests >272K input tokens;
+# plan reviews stay far below that, so the standard rates are used here.
 _DEFAULT_RATES: dict[str, tuple[float, float]] = {
+    "gpt-5.6-sol": (5.0, 30.0),
+    "gpt-5.6": (5.0, 30.0),  # bare alias routes to sol
+    "gpt-5.6-terra": (2.5, 15.0),
+    "gpt-5.6-luna": (1.0, 6.0),
     "gpt-5.5": (5.0, 30.0),
     "gpt-5.5-pro": (30.0, 180.0),
     "gpt-5.4": (5.0, 30.0),

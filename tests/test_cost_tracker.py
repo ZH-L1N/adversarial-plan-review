@@ -31,6 +31,13 @@ def test_estimate_cost_known_model_gpt55_pro():
     assert cost == pytest.approx(expected)
 
 
+def test_estimate_cost_known_model_gpt56_sol():
+    """gpt-5.6-sol = $5/1M input + $30/1M output (standard <=272K context)."""
+    cost = estimate_cost_usd("gpt-5.6-sol", tokens_input=1000, tokens_output=500)
+    expected = (1000 * 5 + 500 * 30) / 1_000_000
+    assert cost == pytest.approx(expected)
+
+
 def test_estimate_cost_unknown_model_returns_zero():
     """Unknown model → 0.0 (caller can warn/log)."""
     assert estimate_cost_usd("future-flagship", 1_000_000, 1_000_000) == 0.0

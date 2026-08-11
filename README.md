@@ -52,7 +52,7 @@ Either path produces structured findings. The OpenAI path uses [strict structure
 2. Drop it into a `.env` file at your repo root:
    ```env
    OPENAI_API_KEY=sk-proj-...
-   OPENAI_REVIEWER_MODEL=gpt-5.5    # default — feel free to omit
+   OPENAI_REVIEWER_MODEL=gpt-5.6-sol    # default — feel free to omit
    ```
 3. The skill reads `.env` at startup. The shipped `.gitignore` excludes `.env`.
 
@@ -128,7 +128,7 @@ All are optional except `OPENAI_API_KEY` when using the OpenAI transport.
 |---|---|---|
 | `ADVERSARIAL_TRANSPORT` | (auto) | Force `openai` or `codex`; otherwise auto-detect |
 | `OPENAI_API_KEY` | — | Required when transport is `openai` |
-| `OPENAI_REVIEWER_MODEL` | `gpt-5.5` | Model used by the OpenAI Responses API path. Other valid options: `gpt-5.5-pro` (~6× cost, higher accuracy), `gpt-5.4`, `gpt-5-mini` |
+| `OPENAI_REVIEWER_MODEL` | `gpt-5.6-sol` | Model used by the OpenAI Responses API path. Other valid options: `gpt-5.6-terra` (half the cost, balanced), `gpt-5.6-luna` (cheapest), `gpt-5.5`, `gpt-5.5-pro` (~6× sol cost, higher accuracy), `gpt-5.4`, `gpt-5-mini` |
 | `OPENAI_MAX_TOKENS` | `8000` | Max output tokens per reviewer response |
 | `OPENAI_INPUT_USD_PER_1M` | (built-in rates) | Override input price per 1M tokens (for non-default billing tiers) |
 | `OPENAI_OUTPUT_USD_PER_1M` | (built-in rates) | Override output price per 1M tokens |
@@ -150,10 +150,13 @@ A complete `.env.example` ships with the repo.
 
 ## Cost estimation
 
-Built-in per-1M-token rates (cached as of April 2026):
+Built-in per-1M-token rates (cached as of July 2026):
 
 | Model | Input $/1M | Output $/1M |
 |---|---|---|
+| `gpt-5.6-sol` | $5 | $30 |
+| `gpt-5.6-terra` | $2.50 | $15 |
+| `gpt-5.6-luna` | $1 | $6 |
 | `gpt-5.5` | $5 | $30 |
 | `gpt-5.5-pro` | $30 | $180 |
 | `gpt-5.4` | $5 | $30 |
@@ -170,7 +173,7 @@ Per round:
 5 rounds ≈ $0.60
 ```
 
-A **stress-test 15-round review** of a complex plan (like the v2 plan's own dogfood) runs about $1.50–$3 on `gpt-5.5`. The `$5` default cap leaves headroom; raise to `$15` for very large plans on `gpt-5.5-pro`.
+A **stress-test 15-round review** of a complex plan (like the v2 plan's own dogfood) runs about $1.50–$3 on `gpt-5.6-sol` (same rates as `gpt-5.5`). The `$5` default cap leaves headroom; raise to `$15` for very large plans on `gpt-5.5-pro`.
 
 The cost cap is *informational* in Phase 1+2 (tracked but not enforced) and *gating* in Phase 4 (loop pauses for user input when exceeded).
 
@@ -224,8 +227,8 @@ The error carries an `is_transient` hint; the loop retries once on transient err
 
 The Codex CLI returned a non-zero exit. Check:
 1. `codex login` — is your auth current?
-2. The chosen model (`OPENAI_REVIEWER_MODEL=gpt-5.5` by default) — is it available to your Codex tier?
-3. Try invoking `codex exec -m gpt-5.5 < /tmp/round-N-prompt.txt` manually to see the full stderr.
+2. The chosen model (`OPENAI_REVIEWER_MODEL=gpt-5.6-sol` by default) — is it available to your Codex tier? The gpt-5.6 family requires a Codex CLI from July 2026 or later; run `codex --version` and update if the model is rejected.
+3. Try invoking `codex exec -m gpt-5.6-sol < /tmp/round-N-prompt.txt` manually to see the full stderr.
 
 ### "Schema validation failed: ..."
 

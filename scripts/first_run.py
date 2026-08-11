@@ -170,7 +170,8 @@ def _is_codex_cli_available(env: dict[str, str]) -> bool:
     # 1. Look for `codex` (or platform-specific extensions) on PATHEXT-aware PATH
     path_env = env.get("PATH", "")
     pathext = env.get("PATHEXT", "")
-    extensions = [""] + [ext.lower() for ext in pathext.split(os.pathsep) if ext] if pathext else [""]
+    # PATHEXT is Windows-only and always ';'-separated (see reviewer.py's twin check).
+    extensions = [""] + [ext.lower() for ext in pathext.split(";") if ext] if pathext else [""]
     for directory in path_env.split(os.pathsep):
         if not directory:
             continue
