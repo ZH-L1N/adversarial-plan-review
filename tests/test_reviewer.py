@@ -561,6 +561,36 @@ def test_resolve_claude_model_id_passes_unknown_values_through():
     assert _resolve_claude_model_id({}, fallback="haiku") == "haiku"
 
 
+def test_resolve_claude_model_id_prefers_the_requested_model_over_aux_entries():
+    """Task-6 live-smoke regression (2026-08-11): a `--model opus` envelope on
+    claude 2.1.227 carried the CLI's internal haiku helper FIRST in modelUsage —
+    first-entry resolution recorded haiku for an opus round. The entry matching
+    the REQUESTED model must win regardless of dict order."""
+    envelope = {
+        "modelUsage": {
+            "claude-haiku-4-5-20251001": {"canonicalModel": "claude-haiku-4-5"},
+            "claude-opus-5": {"canonicalModel": "claude-opus-5"},
+        }
+    }
+    assert _resolve_claude_model_id(envelope, fallback="opus") == "claude-opus-5"
+
+
+def test_resolve_claude_model_id_matches_dated_variants_of_the_requested_model():
+    envelope = {"modelUsage": {"claude-opus-5-20260101": {}}}
+    assert (
+        _resolve_claude_model_id(envelope, fallback="opus") == "claude-opus-5-20260101"
+    )
+
+
+def test_resolve_claude_model_id_first_entry_when_nothing_matches():
+    """Only aux entries present (nothing matching the request): record what ran
+    rather than guessing from the alias — the envelope is the ground truth."""
+    envelope = {
+        "modelUsage": {"claude-haiku-4-5-20251001": {"canonicalModel": "claude-haiku-4-5"}}
+    }
+    assert _resolve_claude_model_id(envelope, fallback="opus") == "claude-haiku-4-5"
+
+
 # --- Claude env-knob validation ----------------------------------------------
 
 

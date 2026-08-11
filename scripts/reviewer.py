@@ -658,17 +658,35 @@ def _resolve_claude_model_id(envelope: dict, *, fallback: str) -> str:
     keyed by the resolved id and each entry carries `canonicalModel`. When the
     envelope carries no `modelUsage` at all, the fallback goes through
     `CLAUDE_MODEL_ALIASES` so the alias still never escapes.
+
+    `modelUsage` can carry MULTIPLE models: the Task-6 live smoke (2026-08-11,
+    claude 2.1.227) showed a `--model opus` run reporting BOTH
+    `claude-haiku-4-5-…` (the CLI's internal auxiliary model) and
+    `claude-opus-5`. Taking the first dict entry recorded haiku for an opus
+    round. So: prefer the entry that matches the model we ASKED for; fall back
+    to first-entry only when nothing matches (e.g. an alias the map doesn't
+    know resolving to an id we can't predict).
     """
+    requested = CLAUDE_MODEL_ALIASES.get(fallback.strip().lower(), fallback)
+
+    def _entry_id(key: object, entry: object) -> str | None:
+        if isinstance(entry, dict):
+            canonical = entry.get("canonicalModel")
+            if isinstance(canonical, str) and canonical:
+                return canonical
+        if isinstance(key, str) and key:
+            return key
+        return None
+
     model_usage = envelope.get("modelUsage")
     if isinstance(model_usage, dict):
-        for key, entry in model_usage.items():
-            if isinstance(entry, dict):
-                canonical = entry.get("canonicalModel")
-                if isinstance(canonical, str) and canonical:
-                    return canonical
-            if isinstance(key, str) and key:
-                return key
-    return CLAUDE_MODEL_ALIASES.get(fallback.strip().lower(), fallback)
+        ids = [i for i in (_entry_id(k, e) for k, e in model_usage.items()) if i]
+        for candidate in ids:  # exact/dated-variant match on the requested model wins
+            if candidate == requested or candidate.startswith(f"{requested}-"):
+                return candidate
+        if ids:
+            return ids[0]
+    return requested
 
 
 def _extract_claude_usage(envelope: dict) -> tuple[int, int]:
