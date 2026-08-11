@@ -3,7 +3,16 @@
 **Status: implemented 2026-08-11 14:09** — one calibrated adversarial round pre-implementation
 (Opus 5, 8 findings 4H/4M, 6 suppressed, all accepted; sidecar in `plans/fixs/`), implemented
 via workflow agents (one mid-run server-error recovery), post-implementation verify round
-found 1H/2M/2L — all fixed. Gate: 327/327 with jsonschema. Live smoke = Task 6.
+found 1H/2M/2L — all fixed. Gate: 330/330 with jsonschema.
+
+**Task 6 live smoke: PASSED 2026-08-11 14:16** (deployed copy, `ADVERSARIAL_TRANSPORT=claude`,
+scratch repo with three planted false premises): 53 s round, `claude-opus-5` recorded
+(after the smoke caught + fixed a real bug — multi-entry `modelUsage` lists the CLI's
+internal haiku helper first, so first-entry resolution recorded haiku for an opus round),
+cost $0.137 from the envelope, tokens 41,050/3,633 cache-inclusive. All three planted
+flaws found as HIGHs with repo-verified evidence (`git ls-files`/`ls` probe output cited),
+5 findings + `suppressed: 3 below-bar observations` per the discipline contract, and the
+reviewed repo's tree byte-identical after the round (containment held with Bash enabled).
 
 ## Why
 
