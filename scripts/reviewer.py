@@ -1,17 +1,23 @@
 """Transport abstraction for the adversarial plan reviewer.
 
-Two paths converge on the same `ReviewResult` shape (defined in
+Three paths converge on the same `ReviewResult` shape (defined in
 `parse_review.py`):
 
 - **OpenAI Responses API** (`gpt-5.6-sol` by default) — JSON schema enforcement
   via the strict structured-output mode. The recommended path.
-- **Codex CLI** (`codex-companion.mjs task`) — v1-compatible prose path used
-  when no `OPENAI_API_KEY` is configured. Severity is inferred via keyword
-  heuristic; no schema enforcement.
+- **Claude Code CLI** (`claude -p --output-format json`) — repo-verifying
+  fallback: the reviewer runs inside the plan's repo with a contained tool
+  floor, so it can open the files the plan cites. No server-side schema
+  enforcement; `parse_claude_response` validates and the D20 retry covers
+  malformed output.
+- **Codex CLI** (`codex exec` / `codex-companion.mjs task`) — v1-compatible
+  prose path. Severity is inferred via keyword heuristic; no schema
+  enforcement.
 
-Transport selection follows v2-plan §5.1:
-  1. `ADVERSARIAL_TRANSPORT=openai|codex` env var, if set
-  2. Otherwise auto-detect: `OPENAI_API_KEY` → openai, else Codex CLI
+Transport selection follows v2-plan §5.1 + the claude-transport plan:
+  1. `ADVERSARIAL_TRANSPORT=openai|codex|claude` env var, if set
+  2. Otherwise auto-detect: `OPENAI_API_KEY` → openai, Claude CLI on PATH →
+     claude, Codex CLI on PATH → codex
   3. Otherwise raise so the first-run UX (`first_run.py`) can take over
 
 Phase 1+2 scope: this module replaces the v1 ad-hoc Codex invocation in
@@ -20,6 +26,7 @@ prompts, and resume support land in Phase 3+4.
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -30,6 +37,7 @@ from parse_review import (
     REVIEW_SCHEMA,
     ReviewResult,
     ReviewSchemaError,
+    parse_claude_response,
     parse_codex_prose,
     parse_openai_response,
 )
@@ -43,6 +51,67 @@ load_local_env()
 DEFAULT_OPENAI_MODEL = "gpt-5.6-sol"
 DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
 DEFAULT_MAX_OUTPUT_TOKENS = 8000
+
+# CLI alias — the resolved model id comes back in the envelope's
+# `modelUsage[*].canonicalModel` and is what we record / rate-key on.
+DEFAULT_CLAUDE_MODEL = "opus"
+
+# CLI alias → canonical model id, for the FALLBACK path only (an envelope with
+# no `modelUsage`). Without it the bare alias reached `ReviewResult.model` /
+# the sidecar AND, being neither a `gpt*` nor a `claude-*` id, slipped past
+# cost_tracker's override gate so an operator's `OPENAI_*_USD_PER_1M` rates got
+# applied to a claude round. Covers the documented aliases; anything else passes
+# through unchanged rather than being guessed at.
+CLAUDE_MODEL_ALIASES = {
+    "opus": "claude-opus-5",
+    "sonnet": "claude-sonnet-5",
+    "fable": "claude-fable-5",
+}
+
+# Containment floor for the claude subprocess (claude-transport plan R1-H1/M4).
+# `--allowedTools` ALONE DOES NOT CONTAIN: probed on claude 2.1.227, a `-p`
+# child launched on a machine whose user settings carry
+# `permissions.defaultMode: bypassPermissions` and granted only Read/Grep/Glob
+# still executed Write and created a file. `--setting-sources ""` is what turns
+# the grant into a real denial (and drops inherited hooks + the reviewed repo's
+# ambient CLAUDE.md priors, ~37k cache tokens on a one-word probe).
+DEFAULT_CLAUDE_TOOLS = "Read,Grep,Glob,Bash"
+CLAUDE_DISALLOWED_TOOLS = (
+    "Write,Edit,MultiEdit,NotebookEdit,"
+    "Bash(git commit*),Bash(git push*),Bash(git reset*),"
+    "Bash(git checkout*),Bash(git restore*),Bash(git stash*),"
+    "Bash(rm -r*),Bash(sudo*)"
+)
+DEFAULT_CLAUDE_TIMEOUT_S = 1200
+DEFAULT_CLAUDE_MAX_TURNS = 120  # 2x the max turn count observed in the R1 probes
+DEFAULT_CLAUDE_MAX_BUDGET_USD = 5.0
+
+# Substrings that mark a claude error envelope as worth one D20 retry.
+_CLAUDE_TRANSIENT_MARKERS = (
+    "overload",
+    "rate limit",
+    "rate_limit",
+    "timeout",
+    "timed out",
+    "temporarily",
+    "connection",
+    "429",
+    "502",
+    "503",
+)
+
+# Substrings that mark an OpenAI failure as "the account is out of money /
+# quota", i.e. no amount of retrying helps and the orchestration should switch
+# transports rather than retry (claude-transport plan R1-H3).
+_OPENAI_QUOTA_MARKERS = (
+    "insufficient_quota",
+    "exceeded your current quota",
+    "billing_hard_limit_reached",
+    "billing hard limit",
+    "credit balance is too low",
+    "out of credits",
+    "quota exhausted",
+)
 
 
 # --- Errors ------------------------------------------------------------------
@@ -67,6 +136,22 @@ class TransportError(RuntimeError):
         self.is_transient = is_transient
 
 
+class QuotaExhaustedError(TransportError):
+    """The selected transport's account has no quota / credit left.
+
+    A distinct type because the response is neither "retry" nor "give up": the
+    orchestration (SKILL.md) catches it and, when the transport was
+    auto-detected and the Claude CLI is available, **rebuilds the prompt for the
+    claude calibration** and re-invokes with an explicit claude selection
+    (claude-transport plan R1-H3). `invoke_reviewer` deliberately does NOT fall
+    back on its own — the prompt it was handed was built for the openai
+    calibration, and silently reusing it would ship the wrong instructions.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, is_transient=False)
+
+
 class TransportUnavailableError(TransportError):
     """No reviewer transport is configured.
 
@@ -84,18 +169,22 @@ class TransportUnavailableError(TransportError):
 
 @dataclass(frozen=True)
 class TransportSelection:
-    name: str  # "openai" | "codex"
+    name: str  # "openai" | "claude" | "codex"
     reason: str  # Human-readable explanation, surfaced in logs
 
 
 def detect_transport(*, env: dict[str, str] | None = None) -> TransportSelection:
     """Pick the active reviewer transport.
 
-    Priority per v2-plan §5.1:
+    Priority per v2-plan §5.1 + the claude-transport plan:
       1. `ADVERSARIAL_TRANSPORT` explicit override
       2. `OPENAI_API_KEY` set → openai
-      3. Codex CLI on PATH → codex
-      4. raise `TransportUnavailableError`
+      3. Claude CLI on PATH → claude (outranks the legacy Codex path)
+      4. Codex CLI on PATH → codex
+      5. raise `TransportUnavailableError`
+
+    `anthropic` is deliberately NOT an alias for `claude` — it rejects like any
+    other unknown value so a typo can never silently pick a transport.
     """
     env = dict(os.environ if env is None else env)
     explicit = (env.get("ADVERSARIAL_TRANSPORT") or "").strip().lower()
@@ -103,21 +192,37 @@ def detect_transport(*, env: dict[str, str] | None = None) -> TransportSelection
         return TransportSelection("openai", "ADVERSARIAL_TRANSPORT=openai")
     if explicit == "codex":
         return TransportSelection("codex", "ADVERSARIAL_TRANSPORT=codex")
+    if explicit == "claude":
+        return TransportSelection("claude", "ADVERSARIAL_TRANSPORT=claude")
     if explicit:
         raise TransportError(
-            f"ADVERSARIAL_TRANSPORT must be 'openai' or 'codex', got '{explicit}'"
+            f"ADVERSARIAL_TRANSPORT must be 'openai', 'codex' or 'claude', got '{explicit}'"
         )
 
     if env.get("OPENAI_API_KEY"):
         return TransportSelection("openai", "OPENAI_API_KEY is set")
+    if _is_claude_cli_available(env):
+        return TransportSelection("claude", "Claude CLI on PATH")
     if _is_codex_cli_available(env):
         return TransportSelection("codex", "Codex CLI on PATH")
 
     raise TransportUnavailableError(
         "No reviewer transport configured. "
-        "Set OPENAI_API_KEY (recommended) or install the Codex CLI; "
+        "Set OPENAI_API_KEY (recommended), install the Claude Code CLI, or "
+        "install the Codex CLI; "
         "see the first-run UX (§5.6 of plans/v2-plan.md) for details."
     )
+
+
+def _is_claude_cli_available(env: dict[str, str]) -> bool:
+    """Hermetic claude-availability check using the injected env's PATH.
+
+    Same env-injection contract as `_is_codex_cli_available` (no
+    `shutil.which`, which would always read the live `os.environ["PATH"]`).
+    There is no plugin-wrapper fallback: the Claude Code CLI is either on PATH
+    or it isn't.
+    """
+    return _executable_on_env_path("claude", env)
 
 
 def _is_codex_cli_available(env: dict[str, str]) -> bool:
@@ -128,6 +233,19 @@ def _is_codex_cli_available(env: dict[str, str]) -> bool:
     contract that `detect_transport(env=...)` advertises. Now walks
     `env["PATH"]` (and PATHEXT on Windows) manually.
     """
+    if _executable_on_env_path("codex", env):
+        return True
+
+    plugin_root = env.get("CLAUDE_PLUGIN_ROOT")
+    if plugin_root:
+        wrapper = os.path.join(plugin_root, "scripts", "codex-companion.mjs")
+        if os.path.isfile(wrapper):
+            return True
+    return False
+
+
+def _executable_on_env_path(name: str, env: dict[str, str]) -> bool:
+    """True if `name` (PATHEXT-aware) is a file on the INJECTED env's PATH."""
     path_env = env.get("PATH", "")
     pathext = env.get("PATHEXT", "")
     # PATHEXT is a Windows construct and is ALWAYS ';'-separated — splitting on
@@ -142,15 +260,8 @@ def _is_codex_cli_available(env: dict[str, str]) -> bool:
         if not directory:
             continue
         for ext in extensions:
-            candidate = os.path.join(directory, f"codex{ext}")
-            if os.path.isfile(candidate):
+            if os.path.isfile(os.path.join(directory, f"{name}{ext}")):
                 return True
-
-    plugin_root = env.get("CLAUDE_PLUGIN_ROOT")
-    if plugin_root:
-        wrapper = os.path.join(plugin_root, "scripts", "codex-companion.mjs")
-        if os.path.isfile(wrapper):
-            return True
     return False
 
 
@@ -163,17 +274,31 @@ def invoke_reviewer(
     round_n: int,
     model: str | None = None,
     transport: TransportSelection | None = None,
+    repo_root: str | None = None,
 ) -> ReviewResult:
     """Run the reviewer against `prompt`, return parsed `ReviewResult`.
 
     `round_n` is required because the post-parse `assign_open_question_ids()`
     helper needs it to mint the `oq_r{round}_{idx}` identifiers (§5.2).
+
+    `repo_root` is the plan's repo — the claude transport runs there so its
+    repo-verification pass can open the files the plan cites. Defaults to the
+    process cwd; the openai and codex transports ignore it.
+
+    Raises `QuotaExhaustedError` (a `TransportError`) when the openai account is
+    out of quota. That is deliberately NOT handled here: the caller owns the
+    transport switch because the switch requires rebuilding the prompt for the
+    claude calibration (claude-transport plan R1-H3).
     """
     if transport is None:
         transport = detect_transport()
 
     if transport.name == "openai":
         return _invoke_openai(prompt, round_n=round_n, model=model)
+    if transport.name == "claude":
+        return _invoke_claude(
+            prompt, round_n=round_n, model=model, repo_root=repo_root or os.getcwd()
+        )
     if transport.name == "codex":
         return _invoke_codex(prompt, round_n=round_n, model=model)
     raise TransportError(f"unknown transport '{transport.name}'")
@@ -217,6 +342,15 @@ def _invoke_openai(prompt: str, *, round_n: int, model: str | None) -> ReviewRes
             max_output_tokens=max_tokens,
         )
     except openai.APIError as exc:
+        # Quota exhaustion is neither transient nor a dead end: it is the
+        # signal to switch transports (claude-transport plan R1-H3). Classify
+        # it FIRST — a quota 429 is a `RateLimitError`, which the transient
+        # check below would otherwise mark retryable, burning D20's retry on a
+        # call that cannot succeed.
+        if _is_openai_quota_error(exc):
+            raise QuotaExhaustedError(
+                f"OpenAI quota/credit exhausted ({type(exc).__name__}): {exc}"
+            ) from exc
         # Code-review finding I3: classify the error so the caller's retry
         # policy (D20) knows whether to retry or escalate. Connection errors,
         # rate limits, and 5xx are transient; auth/permission/bad-request
@@ -252,6 +386,32 @@ def _invoke_openai(prompt: str, *, round_n: int, model: str | None) -> ReviewRes
         raise
 
 
+def _is_openai_quota_error(exc: Exception) -> bool:
+    """True when an OpenAI error means "no quota / credit left", not "retry".
+
+    Covers the `RateLimitError` + `insufficient_quota` pair and the
+    exhausted-credits auth/permission variants (a dead key and a drained
+    prepaid balance surface as different classes across SDK versions, so we
+    match on the machine-readable `code`/`type` first and the message text as a
+    fallback rather than on the exception class).
+    """
+    haystack: list[str] = [str(exc)]
+    for attr in ("code", "type"):
+        value = getattr(exc, attr, None)
+        if isinstance(value, str):
+            haystack.append(value)
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        error = body.get("error")
+        if isinstance(error, dict):
+            for key in ("code", "type", "message"):
+                value = error.get(key)
+                if isinstance(value, str):
+                    haystack.append(value)
+    lowered = " ".join(haystack).lower()
+    return any(marker in lowered for marker in _OPENAI_QUOTA_MARKERS)
+
+
 def _extract_openai_output_text(response: object) -> str:
     """Read the raw model output text in a way that's tolerant to SDK churn."""
     output_text = getattr(response, "output_text", None)
@@ -270,6 +430,285 @@ def _extract_openai_usage(response: object) -> tuple[int, int]:
     tokens_input = getattr(usage, "input_tokens", 0) or 0
     tokens_output = getattr(usage, "output_tokens", 0) or 0
     return int(tokens_input), int(tokens_output)
+
+
+# --- Claude Code CLI path ----------------------------------------------------
+
+
+def _env_int(name: str, default: int) -> int:
+    """Read an integer env knob, or raise a `TransportError` naming the garbage.
+
+    A bare `int()` on a mistyped `.env` value raised a raw `ValueError` that told
+    the operator nothing about which knob was wrong.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise TransportError(f"{name} must be an integer, got {raw!r}") from exc
+
+
+def _env_float(name: str, default: float) -> float:
+    """Read a float env knob, or raise a `TransportError` naming the garbage."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise TransportError(f"{name} must be a number, got {raw!r}") from exc
+
+
+def _invoke_claude(
+    prompt: str,
+    *,
+    round_n: int,
+    model: str | None,
+    repo_root: str | None = None,
+) -> ReviewResult:
+    """Run `claude -p` as a contained, settings-isolated reviewer subprocess.
+
+    The discriminator role travels in the prompt itself (the builder emits
+    `<role>`), so settings isolation costs nothing behaviourally while removing
+    the reviewed repo's hooks, CLAUDE.md priors, and — critically — its
+    `permissions.defaultMode` from the child.
+    """
+    chosen_model = model or os.environ.get("CLAUDE_REVIEWER_MODEL", DEFAULT_CLAUDE_MODEL)
+    tools = os.environ.get("ADVERSARIAL_CLAUDE_TOOLS", DEFAULT_CLAUDE_TOOLS)
+    timeout_s = _env_int("ADVERSARIAL_CLAUDE_TIMEOUT_S", DEFAULT_CLAUDE_TIMEOUT_S)
+    max_turns = _env_int("ADVERSARIAL_CLAUDE_MAX_TURNS", DEFAULT_CLAUDE_MAX_TURNS)
+    # Normalised through float() so a bad value fails here — as a named
+    # TransportError — rather than inside the CLI's own flag parser.
+    max_budget = str(
+        _env_float("ADVERSARIAL_CLAUDE_MAX_BUDGET_USD", DEFAULT_CLAUDE_MAX_BUDGET_USD)
+    )
+
+    cmd = [
+        "claude",
+        "-p",
+        "--output-format",
+        "json",
+        "--model",
+        chosen_model,
+        # Containment + independence (R1-H1, R1-M4): flags, not prose. A prose
+        # instruction to "never modify tracked files" is advisory; these are
+        # enforced by the CLI's own permission layer.
+        "--setting-sources",
+        "",  # no user/project settings -> no inherited bypassPermissions,
+        # hooks, or ambient CLAUDE.md priors
+        "--strict-mcp-config",  # no MCP servers
+        "--tools",
+        tools,  # restrict the tool SET
+        "--allowedTools",
+        tools,  # and pre-grant exactly it (isolated => real denials)
+        "--disallowedTools",
+        CLAUDE_DISALLOWED_TOOLS,
+        # NOTE: `--max-turns` is accepted and enforced on claude 2.1.227 but is
+        # ABSENT from `claude --help` — a silent-removal risk. A test pins it in
+        # the argv builder; the live smoke catches an actual removal.
+        "--max-turns",
+        str(max_turns),
+        "--max-budget-usd",
+        max_budget,  # the documented budget guard
+    ]
+
+    try:
+        # Prompt over stdin: reviewer prompts routinely exceed Windows' ~32KB
+        # argv limit. encoding/errors mirror the codex path (§ non-cp1252
+        # codepoints in prompts).
+        result = subprocess.run(
+            cmd,
+            input=prompt,
+            capture_output=True,
+            check=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_s,
+            cwd=repo_root or os.getcwd(),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TransportError(
+            f"Claude CLI timed out after {timeout_s}s "
+            "(ADVERSARIAL_CLAUDE_TIMEOUT_S). Retry once per D20.",
+            is_transient=True,
+        ) from exc
+    except subprocess.CalledProcessError as exc:
+        # A non-zero exit can still carry the JSON envelope on stdout (a
+        # truncated run is reported as `is_error` AND may exit non-zero).
+        # Classify from the envelope when there is one, so a max-turns/budget
+        # truncation stays transient instead of degrading to an opaque
+        # exit-code error that the retry policy can't act on.
+        envelope = _envelope_or_none(exc.stdout)
+        if envelope is not None:
+            _raise_on_claude_error_envelope(
+                envelope, max_turns=max_turns, max_budget=max_budget
+            )
+        stderr_excerpt = (exc.stderr or "")[-2000:]
+        raise TransportError(
+            f"Claude CLI exited {exc.returncode}. stderr tail:\n{stderr_excerpt}"
+        ) from exc
+    except FileNotFoundError as exc:
+        raise TransportError(
+            "Claude CLI executable not found (claude). "
+            "Install Claude Code or set ADVERSARIAL_TRANSPORT=openai."
+        ) from exc
+
+    envelope = _parse_claude_envelope(result.stdout)
+    # is_error / subtype are checked BEFORE `result` is touched: `result` is
+    # null on every error envelope (R1-H4).
+    _raise_on_claude_error_envelope(envelope, max_turns=max_turns, max_budget=max_budget)
+
+    raw_text = envelope.get("result")
+    if not isinstance(raw_text, str) or not raw_text.strip():
+        raise TransportError(
+            "Claude CLI success envelope carried no `result` text; "
+            "cannot parse reviewer JSON",
+            is_transient=True,
+        )
+
+    resolved_model = _resolve_claude_model_id(envelope, fallback=chosen_model)
+    tokens_input, tokens_output = _extract_claude_usage(envelope)
+    cost_usd = _claude_cost_usd(
+        envelope,
+        resolved_model=resolved_model,
+        tokens_input=tokens_input,
+        tokens_output=tokens_output,
+    )
+
+    return parse_claude_response(
+        raw_text,
+        round_n=round_n,
+        model=resolved_model,
+        usage_input_tokens=tokens_input,
+        usage_output_tokens=tokens_output,
+        cost_usd=cost_usd,
+    )
+
+
+def _parse_claude_envelope(stdout: str) -> dict:
+    """Decode the `claude -p --output-format json` result envelope."""
+    try:
+        envelope = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise TransportError(
+            "Claude CLI stdout is not a JSON result envelope — expected "
+            "`--output-format json`. First 500 chars:\n"
+            f"{stdout[:500]}"
+        ) from exc
+    if not isinstance(envelope, dict):
+        raise TransportError(
+            "Claude CLI `--output-format json` returned "
+            f"{type(envelope).__name__}, expected an object"
+        )
+    return envelope
+
+
+def _envelope_or_none(stdout: object) -> dict | None:
+    """Decode `stdout` as a result envelope, or None when it isn't one."""
+    if not isinstance(stdout, str) or not stdout.strip():
+        return None
+    try:
+        envelope = json.loads(stdout)
+    except json.JSONDecodeError:
+        return None
+    return envelope if isinstance(envelope, dict) else None
+
+
+def _raise_on_claude_error_envelope(
+    envelope: dict, *, max_turns: int, max_budget: str
+) -> None:
+    """Raise a classified `TransportError` for any non-success envelope."""
+    subtype = str(envelope.get("subtype") or "")
+    is_error = bool(envelope.get("is_error"))
+    if not is_error and subtype in ("", "success"):
+        return
+
+    # Truncation by OUR OWN guard: the run didn't fail, it ran out of the
+    # allowance we set. Transient so D20's retry-once applies (the retry
+    # inherits the same caps, so two truncations surface to the operator).
+    if subtype == "error_max_turns":
+        raise TransportError(
+            f"Claude review truncated by our own guard: --max-turns {max_turns} "
+            "exhausted (raise ADVERSARIAL_CLAUDE_MAX_TURNS if this repeats).",
+            is_transient=True,
+        )
+    detail = str(envelope.get("terminal_reason") or "").strip()
+    if "budget" in subtype or "budget" in detail.lower():
+        raise TransportError(
+            f"Claude review truncated by our own guard: --max-budget-usd {max_budget} "
+            "exhausted (raise ADVERSARIAL_CLAUDE_MAX_BUDGET_USD if this repeats).",
+            is_transient=True,
+        )
+
+    lowered = f"{subtype} {detail}".lower()
+    raise TransportError(
+        f"Claude CLI returned an error envelope (subtype={subtype or 'unknown'!r}): "
+        f"{detail or '(no terminal_reason reported)'}",
+        is_transient=any(marker in lowered for marker in _CLAUDE_TRANSIENT_MARKERS),
+    )
+
+
+def _resolve_claude_model_id(envelope: dict, *, fallback: str) -> str:
+    """Resolve the model id actually used, never the `opus`/`sonnet` CLI alias.
+
+    The alias must not reach the rate table or the sidecar: `modelUsage` is
+    keyed by the resolved id and each entry carries `canonicalModel`. When the
+    envelope carries no `modelUsage` at all, the fallback goes through
+    `CLAUDE_MODEL_ALIASES` so the alias still never escapes.
+    """
+    model_usage = envelope.get("modelUsage")
+    if isinstance(model_usage, dict):
+        for key, entry in model_usage.items():
+            if isinstance(entry, dict):
+                canonical = entry.get("canonicalModel")
+                if isinstance(canonical, str) and canonical:
+                    return canonical
+            if isinstance(key, str) and key:
+                return key
+    return CLAUDE_MODEL_ALIASES.get(fallback.strip().lower(), fallback)
+
+
+def _extract_claude_usage(envelope: dict) -> tuple[int, int]:
+    """Return `(tokens_input, tokens_output)` from the envelope's `usage`.
+
+    `tokens_input` sums input + cache-creation + cache-read (R1-M2): a probe
+    reported `input_tokens: 9` while the cache fields carried ~37k on the SAME
+    call, so reading `input_tokens` alone under-reports by three orders of
+    magnitude and would make the cost cap meaningless.
+    """
+    usage = envelope.get("usage")
+    if not isinstance(usage, dict):
+        return 0, 0
+
+    def _field(name: str) -> int:
+        value = usage.get(name)
+        return int(value) if isinstance(value, (int, float)) else 0
+
+    tokens_input = (
+        _field("input_tokens")
+        + _field("cache_creation_input_tokens")
+        + _field("cache_read_input_tokens")
+    )
+    return tokens_input, _field("output_tokens")
+
+
+def _claude_cost_usd(
+    envelope: dict, *, resolved_model: str, tokens_input: int, tokens_output: int
+) -> float:
+    """Cost for one claude round.
+
+    `total_cost_usd` is authoritative and is reported non-zero even on
+    subscription sessions ($0.0384–0.0588 on trivial probe calls), so it is used
+    unconditionally when present. The rate-table estimate is a fallback for a
+    future CLI that stops reporting it, keyed on the RESOLVED model id.
+    """
+    reported = envelope.get("total_cost_usd")
+    if isinstance(reported, (int, float)):
+        return float(reported)
+    return estimate_cost_usd(resolved_model, tokens_input, tokens_output)
 
 
 # --- Codex CLI path ----------------------------------------------------------

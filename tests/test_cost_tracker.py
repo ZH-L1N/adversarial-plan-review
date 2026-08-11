@@ -38,6 +38,48 @@ def test_estimate_cost_known_model_gpt56_sol():
     assert cost == pytest.approx(expected)
 
 
+def test_estimate_cost_known_model_claude_opus_5():
+    """claude-opus-5 = $5/1M input + $25/1M output, keyed by the CANONICAL id."""
+    cost = estimate_cost_usd("claude-opus-5", tokens_input=38209, tokens_output=500)
+    expected = (38209 * 5 + 500 * 25) / 1_000_000
+    assert cost == pytest.approx(expected)
+
+
+def test_estimate_cost_known_model_claude_sonnet_5():
+    cost = estimate_cost_usd("claude-sonnet-5", tokens_input=1000, tokens_output=500)
+    expected = (1000 * 3 + 500 * 15) / 1_000_000
+    assert cost == pytest.approx(expected)
+
+
+def test_estimate_cost_claude_cli_alias_is_not_a_rate_row():
+    """The `opus` CLI alias must never reach the rate table — resolve first."""
+    assert estimate_cost_usd("opus", 1_000_000, 1_000_000) == 0.0
+
+
+def test_estimate_cost_openai_env_override_does_not_touch_claude_rows(monkeypatch):
+    """OPENAI_*_USD_PER_1M is an OpenAI billing-tier knob, not a global one."""
+    monkeypatch.setenv("OPENAI_INPUT_USD_PER_1M", "999.0")
+    monkeypatch.setenv("OPENAI_OUTPUT_USD_PER_1M", "999.0")
+    cost = estimate_cost_usd("claude-opus-5", tokens_input=1_000_000, tokens_output=0)
+    assert cost == pytest.approx(5.0)  # table rate, not the override
+    # ...while the openai rows still honour it.
+    assert estimate_cost_usd("gpt-5.6-sol", 1_000_000, 0) == pytest.approx(999.0)
+
+
+def test_estimate_cost_openai_env_override_applies_only_to_gpt_models(monkeypatch):
+    """Belt and braces: the gate allow-LISTS `gpt*` instead of denying `claude*`.
+
+    A CLI alias that slipped through model resolution (`opus`, `sonnet`) is
+    neither a gpt id nor a `claude-*` id, so the deny-list form silently priced
+    it at the operator's OpenAI contract rates.
+    """
+    monkeypatch.setenv("OPENAI_INPUT_USD_PER_1M", "999.0")
+    monkeypatch.setenv("OPENAI_OUTPUT_USD_PER_1M", "999.0")
+    for non_openai_model in ("opus", "sonnet", "claude-opus-5-20260101"):
+        assert estimate_cost_usd(non_openai_model, 1_000_000, 0) == 0.0
+    assert estimate_cost_usd("gpt-5.6-sol", 1_000_000, 0) == pytest.approx(999.0)
+
+
 def test_estimate_cost_unknown_model_returns_zero():
     """Unknown model → 0.0 (caller can warn/log)."""
     assert estimate_cost_usd("future-flagship", 1_000_000, 1_000_000) == 0.0

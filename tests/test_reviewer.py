@@ -1,18 +1,28 @@
 """Tests for scripts/reviewer.py — transport detection + error classification."""
 from __future__ import annotations
 
+import json
 import os
+import subprocess
 
 import pytest
 
+import reviewer
 from reviewer import (
+    CLAUDE_MODEL_ALIASES,
+    DEFAULT_CLAUDE_MODEL,
     DEFAULT_OPENAI_MODEL,
+    QuotaExhaustedError,
     TransportError,
     TransportSelection,
     TransportUnavailableError,
+    _invoke_claude,
+    _is_claude_cli_available,
     _is_codex_cli_available,
+    _resolve_claude_model_id,
     _resolve_codex_command,
     detect_transport,
+    invoke_reviewer,
 )
 
 
@@ -32,9 +42,23 @@ def test_detect_transport_explicit_codex_override():
     assert sel.name == "codex"
 
 
+def test_detect_transport_explicit_claude_override():
+    env = {"ADVERSARIAL_TRANSPORT": "claude"}
+    sel = detect_transport(env=env)
+    assert sel.name == "claude"
+    assert "ADVERSARIAL_TRANSPORT" in sel.reason
+
+
 def test_detect_transport_invalid_explicit_value_raises():
+    env = {"ADVERSARIAL_TRANSPORT": "gemini"}
+    with pytest.raises(TransportError, match="must be 'openai', 'codex' or 'claude'"):
+        detect_transport(env=env)
+
+
+def test_detect_transport_anthropic_is_not_an_alias_for_claude():
+    """R1-M3: `anthropic` rejects like any other unknown value (decided, not an alias)."""
     env = {"ADVERSARIAL_TRANSPORT": "anthropic"}
-    with pytest.raises(TransportError, match="must be 'openai' or 'codex'"):
+    with pytest.raises(TransportError, match="got 'anthropic'"):
         detect_transport(env=env)
 
 
@@ -110,6 +134,602 @@ def test_is_codex_cli_available_finds_codex(tmp_path):
     assert _is_codex_cli_available(env) is True
 
 
+# --- Claude CLI detection ----------------------------------------------------
+
+
+def test_detect_transport_claude_via_path(tmp_path):
+    fake = tmp_path / "claude"
+    fake.write_text("#!/bin/sh\nexit 0")
+    fake.chmod(0o755)
+    env = {"PATH": str(tmp_path), "PATHEXT": ""}
+    sel = detect_transport(env=env)
+    assert sel.name == "claude"
+    assert "PATH" in sel.reason
+
+
+def test_detect_transport_picks_openai_over_claude_when_both_available(tmp_path):
+    """Priority: explicit > OPENAI_API_KEY > claude > codex."""
+    (tmp_path / "claude").write_text("")
+    (tmp_path / "claude").chmod(0o755)
+    env = {"PATH": str(tmp_path), "PATHEXT": "", "OPENAI_API_KEY": "sk-test"}
+    assert detect_transport(env=env).name == "openai"
+
+
+def test_detect_transport_picks_claude_over_codex_when_both_available(tmp_path):
+    """Claude outranks the legacy Codex CLI in the auto-detect ladder."""
+    for name in ("claude", "codex"):
+        (tmp_path / name).write_text("")
+        (tmp_path / name).chmod(0o755)
+    env = {"PATH": str(tmp_path), "PATHEXT": ""}
+    assert detect_transport(env=env).name == "claude"
+
+
+def test_is_claude_cli_available_hermetic(empty_env):
+    """Hermetic env walk: empty PATH is False even when claude is on the real PATH."""
+    assert _is_claude_cli_available(empty_env) is False
+
+
+def test_is_claude_cli_available_via_pathext_on_windows(tmp_path):
+    (tmp_path / "claude.exe").write_text("")
+    env = {"PATH": str(tmp_path), "PATHEXT": ".COM;.EXE;.BAT"}
+    assert _is_claude_cli_available(env) is True
+
+
+# --- Claude CLI invocation ---------------------------------------------------
+
+
+CANNED_REVIEW_JSON = json.dumps(
+    {"status": "NO_FINDINGS", "findings": [], "open_questions": []}
+)
+
+
+def _claude_envelope(**overrides):
+    """A `claude -p --output-format json` result envelope (probed shape, 2.1.227)."""
+    envelope = {
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "result": CANNED_REVIEW_JSON,
+        "duration_ms": 4200,
+        "num_turns": 12,
+        "total_cost_usd": 0.0384,
+        "usage": {
+            "input_tokens": 9,
+            "output_tokens": 500,
+            "cache_creation_input_tokens": 1200,
+            "cache_read_input_tokens": 37000,
+        },
+        "modelUsage": {
+            "claude-opus-5-20260101": {
+                "canonicalModel": "claude-opus-5",
+                "inputTokens": 9,
+                "outputTokens": 500,
+            }
+        },
+        "permission_denials": [],
+        "terminal_reason": "end_turn",
+    }
+    envelope.update(overrides)
+    return envelope
+
+
+class _FakeRun:
+    """Records the subprocess.run call and returns a canned CompletedProcess."""
+
+    def __init__(self, stdout: str, *, raises: Exception | None = None) -> None:
+        self.stdout = stdout
+        self.raises = raises
+        self.calls: list[dict] = []
+
+    def __call__(self, cmd, **kwargs):
+        self.calls.append({"cmd": cmd, **kwargs})
+        if self.raises is not None:
+            raise self.raises
+        return subprocess.CompletedProcess(cmd, 0, stdout=self.stdout, stderr="")
+
+
+@pytest.fixture
+def clean_claude_env(monkeypatch):
+    """Drop every ADVERSARIAL_CLAUDE_* / CLAUDE_REVIEWER_MODEL override."""
+    for key in (
+        "CLAUDE_REVIEWER_MODEL",
+        "ADVERSARIAL_CLAUDE_TOOLS",
+        "ADVERSARIAL_CLAUDE_TIMEOUT_S",
+        "ADVERSARIAL_CLAUDE_MAX_TURNS",
+        "ADVERSARIAL_CLAUDE_MAX_BUDGET_USD",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+
+def test_invoke_claude_happy_path(monkeypatch, clean_claude_env, tmp_path):
+    fake = _FakeRun(json.dumps(_claude_envelope()))
+    monkeypatch.setattr(reviewer.subprocess, "run", fake)
+
+    result = _invoke_claude(
+        "PROMPT BODY", round_n=1, model=None, repo_root=str(tmp_path)
+    )
+
+    assert result.status == "NO_FINDINGS"
+    assert result.transport == "claude"
+    assert result.model == "claude-opus-5"  # resolved id, not the `opus` alias
+    call = fake.calls[0]
+    # Prompt travels over stdin (Windows argv limits), cwd is the reviewed repo.
+    assert call["input"] == "PROMPT BODY"
+    assert call["cwd"] == str(tmp_path)
+    assert call["timeout"] == 1200
+    assert call["encoding"] == "utf-8"
+
+
+def test_invoke_claude_argv_carries_containment_flags(
+    monkeypatch, clean_claude_env, tmp_path
+):
+    """R1-H1/M4: containment is enforced by flags, not prose."""
+    fake = _FakeRun(json.dumps(_claude_envelope()))
+    monkeypatch.setattr(reviewer.subprocess, "run", fake)
+
+    _invoke_claude("p", round_n=1, model=None, repo_root=str(tmp_path))
+    cmd = fake.calls[0]["cmd"]
+
+    assert cmd[:2] == ["claude", "-p"]
+    assert cmd[cmd.index("--output-format") + 1] == "json"
+    assert cmd[cmd.index("--model") + 1] == DEFAULT_CLAUDE_MODEL
+    # settings isolation: no inherited bypassPermissions / hooks / CLAUDE.md priors
+    assert cmd[cmd.index("--setting-sources") + 1] == ""
+    assert "--strict-mcp-config" in cmd
+    # tool SET restricted AND pre-granted, plus the write/git/rm floor
+    assert cmd[cmd.index("--tools") + 1] == "Read,Grep,Glob,Bash"
+    assert cmd[cmd.index("--allowedTools") + 1] == "Read,Grep,Glob,Bash"
+    disallowed = cmd[cmd.index("--disallowedTools") + 1]
+    for denied in (
+        "Write",
+        "Edit",
+        "MultiEdit",
+        "NotebookEdit",
+        "Bash(git commit*)",
+        "Bash(git push*)",
+        "Bash(git reset*)",
+        "Bash(git checkout*)",
+        "Bash(git restore*)",
+        "Bash(git stash*)",
+        "Bash(rm -r*)",
+        "Bash(sudo*)",
+    ):
+        assert denied in disallowed
+    assert cmd[cmd.index("--max-budget-usd") + 1] == "5.0"
+
+
+def test_invoke_claude_pins_max_turns_flag(monkeypatch, clean_claude_env, tmp_path):
+    """`--max-turns` is enforced but ABSENT from `claude --help` on 2.1.227.
+
+    Silent-removal canary (R1-H4): if the CLI drops the flag, the Task-6 live
+    smoke fails loudly — this test pins that the argv builder still emits it.
+    """
+    fake = _FakeRun(json.dumps(_claude_envelope()))
+    monkeypatch.setattr(reviewer.subprocess, "run", fake)
+    _invoke_claude("p", round_n=1, model=None, repo_root=str(tmp_path))
+    cmd = fake.calls[0]["cmd"]
+    assert cmd[cmd.index("--max-turns") + 1] == "120"
+
+
+def test_invoke_claude_env_knobs_override_defaults(monkeypatch, tmp_path):
+    monkeypatch.setenv("CLAUDE_REVIEWER_MODEL", "sonnet")
+    monkeypatch.setenv("ADVERSARIAL_CLAUDE_TOOLS", "Read,Grep,Glob")
+    monkeypatch.setenv("ADVERSARIAL_CLAUDE_TIMEOUT_S", "600")
+    monkeypatch.setenv("ADVERSARIAL_CLAUDE_MAX_TURNS", "40")
+    monkeypatch.setenv("ADVERSARIAL_CLAUDE_MAX_BUDGET_USD", "1.5")
+    fake = _FakeRun(json.dumps(_claude_envelope()))
+    monkeypatch.setattr(reviewer.subprocess, "run", fake)
+
+    _invoke_claude("p", round_n=1, model=None, repo_root=str(tmp_path))
+
+    cmd = fake.calls[0]["cmd"]
+    assert cmd[cmd.index("--model") + 1] == "sonnet"
+    assert cmd[cmd.index("--tools") + 1] == "Read,Grep,Glob"
+    assert cmd[cmd.index("--max-turns") + 1] == "40"
+    assert cmd[cmd.index("--max-budget-usd") + 1] == "1.5"
+    assert fake.calls[0]["timeout"] == 600
+
+
+def test_invoke_claude_explicit_model_argument_wins(monkeypatch, tmp_path):
+    monkeypatch.setenv("CLAUDE_REVIEWER_MODEL", "sonnet")
+    fake = _FakeRun(json.dumps(_claude_envelope()))
+    monkeypatch.setattr(reviewer.subprocess, "run", fake)
+    _invoke_claude("p", round_n=1, model="opus", repo_root=str(tmp_path))
+    cmd = fake.calls[0]["cmd"]
+    assert cmd[cmd.index("--model") + 1] == "opus"
+
+
+def test_invoke_claude_cost_comes_from_total_cost_usd(
+    monkeypatch, clean_claude_env, tmp_path
+):
+    """R1-M2: total_cost_usd is non-zero even on subscription sessions — record it."""
+    fake = _FakeRun(json.dumps(_claude_envelope(total_cost_usd=0.0588)))
+    monkeypatch.setattr(reviewer.subprocess, "run", fake)
+    result = _invoke_claude("p", round_n=1, model=None, repo_root=str(tmp_path))
+    assert result.usage.cost_usd == pytest.approx(0.0588)
+
+
+def test_invoke_claude_tokens_input_sums_cache_fields(
+    monkeypatch, clean_claude_env, tmp_path
+):
+    """R1-M2: input_tokens was 9 while cache fields carried ~37k on the same call."""
+    fake = _FakeRun(json.dumps(_claude_envelope()))
+    monkeypatch.setattr(reviewer.subprocess, "run", fake)
+    result = _invoke_claude("p", round_n=1, model=None, repo_root=str(tmp_path))
+    assert result.usage.tokens_input == 9 + 1200 + 37000
+    assert result.usage.tokens_output == 500
+
+
+def test_invoke_claude_estimate_fallback_keyed_on_canonical_model(
+    monkeypatch, clean_claude_env, tmp_path
+):
+    """Estimate ONLY when total_cost_usd is absent, keyed on the resolved id."""
+    envelope = _claude_envelope()
+    del envelope["total_cost_usd"]
+    fake = _FakeRun(json.dumps(envelope))
+    monkeypatch.setattr(reviewer.subprocess, "run", fake)
+    result = _invoke_claude("p", round_n=1, model=None, repo_root=str(tmp_path))
+    tokens_input = 9 + 1200 + 37000
+    expected = (tokens_input * 5.0 + 500 * 25.0) / 1_000_000  # claude-opus-5 rates
+    assert result.usage.cost_usd == pytest.approx(expected)
+
+
+def test_invoke_claude_error_max_turns_is_transient_and_names_budget(
+    monkeypatch, clean_claude_env, tmp_path
+):
+    """R1-H4: is_error/subtype are checked BEFORE result, which is null on errors."""
+    envelope = _claude_envelope(
+        subtype="error_max_turns", is_error=True, result=None
+    )
+    fake = _FakeRun(json.dumps(envelope))
+    monkeypatch.setattr(reviewer.subprocess, "run", fake)
+    with pytest.raises(TransportError) as exc:
+        _invoke_claude("p", round_n=1, model=None, repo_root=str(tmp_path))
+    assert exc.value.is_transient is True
+    assert "--max-turns 120" in str(exc.value)
+
+
+def test_invoke_claude_budget_exhaustion_is_transient(
+    monkeypatch, clean_claude_env, tmp_path
+):
+    envelope = _claude_envelope(
+        subtype="error_max_budget_usd", is_error=True, result=None
+    )
+    fake = _FakeRun(json.dumps(envelope))
+    monkeypatch.setattr(reviewer.subprocess, "run", fake)
+    with pytest.raises(TransportError) as exc:
+        _invoke_claude("p", round_n=1, model=None, repo_root=str(tmp_path))
+    assert exc.value.is_transient is True
+    assert "--max-budget-usd 5.0" in str(exc.value)
+
+
+def test_invoke_claude_generic_error_envelope_is_permanent(
+    monkeypatch, clean_claude_env, tmp_path
+):
+    envelope = _claude_envelope(
+        subtype="error_during_execution",
+        is_error=True,
+        result=None,
+        terminal_reason="invalid request",
+    )
+    fake = _FakeRun(json.dumps(envelope))
+    monkeypatch.setattr(reviewer.subprocess, "run", fake)
+    with pytest.raises(TransportError) as exc:
+        _invoke_claude("p", round_n=1, model=None, repo_root=str(tmp_path))
+    assert exc.value.is_transient is False
+
+
+def test_invoke_claude_overload_error_envelope_is_transient(
+    monkeypatch, clean_claude_env, tmp_path
+):
+    envelope = _claude_envelope(
+        subtype="error_during_execution",
+        is_error=True,
+        result=None,
+        terminal_reason="API overloaded_error, please retry",
+    )
+    fake = _FakeRun(json.dumps(envelope))
+    monkeypatch.setattr(reviewer.subprocess, "run", fake)
+    with pytest.raises(TransportError) as exc:
+        _invoke_claude("p", round_n=1, model=None, repo_root=str(tmp_path))
+    assert exc.value.is_transient is True
+
+
+def test_invoke_claude_timeout_is_transient(monkeypatch, clean_claude_env, tmp_path):
+    fake = _FakeRun("", raises=subprocess.TimeoutExpired(cmd=["claude"], timeout=1200))
+    monkeypatch.setattr(reviewer.subprocess, "run", fake)
+    with pytest.raises(TransportError) as exc:
+        _invoke_claude("p", round_n=1, model=None, repo_root=str(tmp_path))
+    assert exc.value.is_transient is True
+    assert "1200" in str(exc.value)
+
+
+def test_invoke_claude_called_process_error_mirrors_codex_path(
+    monkeypatch, clean_claude_env, tmp_path
+):
+    err = subprocess.CalledProcessError(2, ["claude"], stderr="boom stderr tail")
+    fake = _FakeRun("", raises=err)
+    monkeypatch.setattr(reviewer.subprocess, "run", fake)
+    with pytest.raises(TransportError, match="boom stderr tail"):
+        _invoke_claude("p", round_n=1, model=None, repo_root=str(tmp_path))
+
+
+def test_invoke_claude_classifies_error_envelope_on_nonzero_exit(
+    monkeypatch, clean_claude_env, tmp_path
+):
+    """A truncated run may ALSO exit non-zero — don't lose the transient hint."""
+    envelope = _claude_envelope(subtype="error_max_turns", is_error=True, result=None)
+    err = subprocess.CalledProcessError(
+        1, ["claude"], output=json.dumps(envelope), stderr=""
+    )
+    fake = _FakeRun("", raises=err)
+    monkeypatch.setattr(reviewer.subprocess, "run", fake)
+    with pytest.raises(TransportError) as exc:
+        _invoke_claude("p", round_n=1, model=None, repo_root=str(tmp_path))
+    assert exc.value.is_transient is True
+    assert "--max-turns 120" in str(exc.value)
+
+
+def test_invoke_claude_missing_executable_is_actionable(
+    monkeypatch, clean_claude_env, tmp_path
+):
+    fake = _FakeRun("", raises=FileNotFoundError("claude"))
+    monkeypatch.setattr(reviewer.subprocess, "run", fake)
+    with pytest.raises(TransportError, match="not found"):
+        _invoke_claude("p", round_n=1, model=None, repo_root=str(tmp_path))
+
+
+def test_invoke_claude_unparseable_envelope_raises_transport_error(
+    monkeypatch, clean_claude_env, tmp_path
+):
+    fake = _FakeRun("not json at all")
+    monkeypatch.setattr(reviewer.subprocess, "run", fake)
+    with pytest.raises(TransportError, match="--output-format json"):
+        _invoke_claude("p", round_n=1, model=None, repo_root=str(tmp_path))
+
+
+# --- Claude model-id resolution (alias must never escape) ---------------------
+
+
+def test_invoke_claude_without_model_usage_records_the_canonical_id(
+    monkeypatch, clean_claude_env, tmp_path
+):
+    """No `modelUsage` → resolve the `opus` alias, don't record the alias itself."""
+    envelope = _claude_envelope()
+    del envelope["modelUsage"]
+    fake = _FakeRun(json.dumps(envelope))
+    monkeypatch.setattr(reviewer.subprocess, "run", fake)
+
+    result = _invoke_claude("p", round_n=1, model=None, repo_root=str(tmp_path))
+    assert result.model == "claude-opus-5"
+
+
+def test_invoke_claude_model_usage_still_wins_over_the_alias_map(
+    monkeypatch, clean_claude_env, tmp_path
+):
+    """The envelope is authoritative: a sonnet run reported as such is recorded so."""
+    monkeypatch.setenv("CLAUDE_REVIEWER_MODEL", "opus")
+    envelope = _claude_envelope(
+        modelUsage={
+            "claude-sonnet-5-20260101": {
+                "canonicalModel": "claude-sonnet-5",
+                "inputTokens": 9,
+                "outputTokens": 500,
+            }
+        }
+    )
+    fake = _FakeRun(json.dumps(envelope))
+    monkeypatch.setattr(reviewer.subprocess, "run", fake)
+
+    result = _invoke_claude("p", round_n=1, model=None, repo_root=str(tmp_path))
+    assert result.model == "claude-sonnet-5"
+
+
+def test_invoke_claude_alias_fallback_dodges_the_openai_rate_override(
+    monkeypatch, clean_claude_env, tmp_path
+):
+    """An `opus` alias slipped past cost_tracker's gate and got OpenAI rates."""
+    monkeypatch.setenv("OPENAI_INPUT_USD_PER_1M", "999.0")
+    monkeypatch.setenv("OPENAI_OUTPUT_USD_PER_1M", "999.0")
+    envelope = _claude_envelope()
+    del envelope["modelUsage"]
+    del envelope["total_cost_usd"]  # force the rate-table estimate path
+    fake = _FakeRun(json.dumps(envelope))
+    monkeypatch.setattr(reviewer.subprocess, "run", fake)
+
+    result = _invoke_claude("p", round_n=1, model=None, repo_root=str(tmp_path))
+
+    tokens_input = 9 + 1200 + 37000
+    expected = (tokens_input * 5.0 + 500 * 25.0) / 1_000_000  # claude-opus-5 rates
+    assert result.usage.cost_usd == pytest.approx(expected)
+
+
+@pytest.mark.parametrize(
+    "alias,canonical",
+    [("opus", "claude-opus-5"), ("sonnet", "claude-sonnet-5"), ("fable", "claude-fable-5")],
+)
+def test_claude_model_aliases_cover_the_documented_cli_aliases(alias, canonical):
+    assert CLAUDE_MODEL_ALIASES[alias] == canonical
+
+
+def test_resolve_claude_model_id_passes_unknown_values_through():
+    """An id we don't map (or a future alias) is recorded verbatim, not guessed."""
+    assert (
+        _resolve_claude_model_id({}, fallback="claude-opus-5-20260101")
+        == "claude-opus-5-20260101"
+    )
+    assert _resolve_claude_model_id({}, fallback="haiku") == "haiku"
+
+
+# --- Claude env-knob validation ----------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "env_var,bad_value",
+    [
+        ("ADVERSARIAL_CLAUDE_MAX_TURNS", "lots"),
+        ("ADVERSARIAL_CLAUDE_MAX_TURNS", "12.5"),
+        ("ADVERSARIAL_CLAUDE_TIMEOUT_S", "20 minutes"),
+        ("ADVERSARIAL_CLAUDE_MAX_BUDGET_USD", "$5"),
+    ],
+)
+def test_invoke_claude_malformed_env_knob_raises_named_transport_error(
+    monkeypatch, clean_claude_env, tmp_path, env_var, bad_value
+):
+    """A typo in .env must name the var and the value, not raise a bare ValueError."""
+    monkeypatch.setenv(env_var, bad_value)
+    fake = _FakeRun(json.dumps(_claude_envelope()))
+    monkeypatch.setattr(reviewer.subprocess, "run", fake)
+
+    with pytest.raises(TransportError) as exc:
+        _invoke_claude("p", round_n=1, model=None, repo_root=str(tmp_path))
+
+    message = str(exc.value)
+    assert env_var in message
+    assert bad_value in message
+    assert exc.value.is_transient is False
+    # Fail before spawning the CLI — a bad cap must never reach the subprocess.
+    assert fake.calls == []
+
+
+def test_invoke_reviewer_threads_repo_root_to_claude(
+    monkeypatch, clean_claude_env, tmp_path
+):
+    fake = _FakeRun(json.dumps(_claude_envelope()))
+    monkeypatch.setattr(reviewer.subprocess, "run", fake)
+    invoke_reviewer(
+        "p",
+        round_n=1,
+        transport=TransportSelection("claude", "test"),
+        repo_root=str(tmp_path),
+    )
+    assert fake.calls[0]["cwd"] == str(tmp_path)
+
+
+def test_invoke_reviewer_defaults_repo_root_to_cwd(
+    monkeypatch, clean_claude_env, tmp_path
+):
+    monkeypatch.chdir(tmp_path)
+    fake = _FakeRun(json.dumps(_claude_envelope()))
+    monkeypatch.setattr(reviewer.subprocess, "run", fake)
+    invoke_reviewer("p", round_n=1, transport=TransportSelection("claude", "test"))
+    assert fake.calls[0]["cwd"] == os.getcwd()
+
+
+# --- Quota exhaustion (runtime fallback is the orchestration's job) ----------
+
+
+def test_quota_exhausted_error_is_a_transport_error():
+    err = QuotaExhaustedError("out of credit")
+    assert isinstance(err, TransportError)
+    assert err.is_transient is False
+
+
+def test_invoke_reviewer_propagates_quota_exhausted(monkeypatch):
+    """R1-H3: no silent in-module fallback — the prompt was built for openai."""
+
+    def boom(prompt, *, round_n, model):
+        raise QuotaExhaustedError("insufficient_quota")
+
+    monkeypatch.setattr(reviewer, "_invoke_openai", boom)
+    with pytest.raises(QuotaExhaustedError):
+        invoke_reviewer(
+            "p", round_n=1, transport=TransportSelection("openai", "test")
+        )
+
+
+class _FakeApiError(Exception):
+    """Stand-in for an SDK error object carrying a machine-readable code/body."""
+
+    def __init__(self, message, *, code=None, body=None):
+        super().__init__(message)
+        self.code = code
+        self.body = body
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        _FakeApiError("Rate limit reached", code="insufficient_quota"),
+        _FakeApiError(
+            "429",
+            body={"error": {"code": "insufficient_quota", "message": "no quota"}},
+        ),
+        _FakeApiError("You exceeded your current quota, please check your plan"),
+        _FakeApiError("Your credit balance is too low to access the API"),
+        _FakeApiError("billing_hard_limit_reached"),
+    ],
+)
+def test_openai_quota_error_classifier_matches_quota_class_errors(exc):
+    assert reviewer._is_openai_quota_error(exc) is True
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        _FakeApiError("Rate limit reached for gpt-5.6-sol", code="rate_limit_exceeded"),
+        _FakeApiError("Incorrect API key provided", code="invalid_api_key"),
+        _FakeApiError("The server had an error while processing your request"),
+    ],
+)
+def test_openai_quota_error_classifier_ignores_ordinary_failures(exc):
+    """A plain 429 must stay transient — retrying it can succeed."""
+    assert reviewer._is_openai_quota_error(exc) is False
+
+
+def test_invoke_openai_maps_quota_error_to_quota_exhausted(monkeypatch):
+    """A quota 429 is a RateLimitError: without this it'd burn D20's retry."""
+    import httpx
+    import openai
+
+    request = httpx.Request("POST", "https://api.openai.com/v1/responses")
+    quota_error = openai.RateLimitError(
+        "You exceeded your current quota",
+        response=httpx.Response(429, request=request),
+        body={"error": {"code": "insufficient_quota"}},
+    )
+
+    class _FakeClient:
+        def __init__(self):
+            self.responses = self
+
+        def create(self, **kwargs):
+            raise quota_error
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setattr(openai, "OpenAI", lambda *a, **kw: _FakeClient())
+
+    with pytest.raises(QuotaExhaustedError, match="quota"):
+        reviewer._invoke_openai("p", round_n=1, model="gpt-5.6-sol")
+
+
+def test_invoke_openai_plain_rate_limit_stays_transient(monkeypatch):
+    import httpx
+    import openai
+
+    request = httpx.Request("POST", "https://api.openai.com/v1/responses")
+    rate_limited = openai.RateLimitError(
+        "Rate limit reached for gpt-5.6-sol in organization org-x",
+        response=httpx.Response(429, request=request),
+        body={"error": {"code": "rate_limit_exceeded"}},
+    )
+
+    class _FakeClient:
+        def __init__(self):
+            self.responses = self
+
+        def create(self, **kwargs):
+            raise rate_limited
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setattr(openai, "OpenAI", lambda *a, **kw: _FakeClient())
+
+    with pytest.raises(TransportError) as exc:
+        reviewer._invoke_openai("p", round_n=1, model="gpt-5.6-sol")
+    assert not isinstance(exc.value, QuotaExhaustedError)
+    assert exc.value.is_transient is True
+
+
 # --- TransportError classification ------------------------------------------
 
 
@@ -172,6 +792,11 @@ def test_resolve_codex_command_neither_path_nor_companion(monkeypatch):
 def test_default_openai_model_is_gpt_56_sol():
     """July 2026 flagship; bumped from the v2-launch gpt-5.5 default (deployed 2026-08)."""
     assert DEFAULT_OPENAI_MODEL == "gpt-5.6-sol"
+
+
+def test_default_claude_model_is_the_opus_alias():
+    """CLI alias — the resolved id comes back in modelUsage.canonicalModel."""
+    assert DEFAULT_CLAUDE_MODEL == "opus"
 
 
 # --- TransportSelection ------------------------------------------------------

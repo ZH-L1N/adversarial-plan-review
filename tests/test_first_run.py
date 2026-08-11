@@ -136,6 +136,40 @@ def test_check_or_prompt_raises_when_nothing_configured(empty_env):
         check_or_prompt(env=empty_env)
 
 
+def test_check_or_prompt_reports_claude_when_only_claude(tmp_path):
+    """`ready` is any transport — a Claude Code login alone is enough."""
+    fake = tmp_path / "claude"
+    fake.write_text("")
+    fake.chmod(0o755)
+    (tmp_path / "claude.exe").write_text("")
+    env = {"PATH": str(tmp_path), "PATHEXT": ".COM;.EXE"}
+    status = check_or_prompt(env=env)
+    assert status.ready is True
+    assert status.transport.name == "claude"
+    assert status.has_claude is True
+    assert status.has_openai_key is False
+    assert status.has_codex is False
+
+
+def test_check_or_prompt_lists_every_available_transport(tmp_path):
+    for name in ("claude", "codex", "claude.exe", "codex.exe"):
+        (tmp_path / name).write_text("")
+    env = {
+        "PATH": str(tmp_path),
+        "PATHEXT": ".COM;.EXE",
+        "OPENAI_API_KEY": "sk-test",
+    }
+    status = check_or_prompt(env=env)
+    assert status.transport.name == "openai"  # detection order unchanged
+    assert status.available_transports == ["openai", "claude", "codex"]
+
+
+def test_check_or_prompt_has_claude_false_in_hermetic_env(empty_env):
+    """The claude probe honours the injected PATH, not the real one."""
+    env = {**empty_env, "OPENAI_API_KEY": "sk-test"}
+    assert check_or_prompt(env=env).has_claude is False
+
+
 def test_check_or_prompt_returns_codex_when_only_codex(tmp_path):
     fake_codex = tmp_path / "codex"
     fake_codex.write_text("")
@@ -173,11 +207,19 @@ def test_is_codex_cli_available_via_plugin_root(tmp_path):
 # --- setup_guide_text -------------------------------------------------------
 
 
-def test_setup_guide_mentions_both_transports():
+def test_setup_guide_mentions_all_three_transports():
     text = setup_guide_text()
     assert "OpenAI API key" in text
+    assert "Claude Code CLI" in text
     assert "Codex CLI" in text
     assert "platform.openai.com/api-keys" in text
+
+
+def test_setup_guide_claude_section_says_no_key_and_how_to_force():
+    text = setup_guide_text()
+    assert "subscription" in text
+    assert "NO API key" in text
+    assert "ADVERSARIAL_TRANSPORT=claude" in text
 
 
 # --- CLI --check entry point ------------------------------------------------
@@ -232,3 +274,34 @@ def test_first_run_status_ready_property():
 
     blank = FirstRunStatus(transport=None, has_openai_key=False, has_codex=False)
     assert blank.ready is False
+
+
+def test_first_run_status_ready_for_claude_only():
+    """`ready` = any transport, so a claude-only host is ready."""
+    from reviewer import TransportSelection
+
+    status = FirstRunStatus(
+        transport=TransportSelection(name="claude", reason="Claude CLI on PATH"),
+        has_openai_key=False,
+        has_codex=False,
+        has_claude=True,
+    )
+    assert status.ready is True
+    assert status.available_transports == ["claude"]
+
+
+# --- CLI --check names the transports found ----------------------------------
+
+
+def test_cli_check_names_available_transports(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    repo_root = Path(__file__).resolve().parent.parent
+    script = repo_root / "scripts" / "first_run.py"
+    result = subprocess.run(
+        [sys.executable, str(script), "--check"],
+        capture_output=True,
+        text=True,
+        env=os.environ.copy(),
+    )
+    assert result.returncode == 0
+    assert "transports available:" in result.stdout

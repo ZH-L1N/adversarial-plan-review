@@ -248,12 +248,16 @@ def _decision_label(decision: str) -> str:
     return _DECISION_LABELS.get(decision, decision)
 
 
+_TRANSPORT_LABELS = {
+    "openai": "OpenAI Responses API",
+    "claude": "Claude Code CLI",
+    "codex": "Codex CLI",
+}
+
+
 def _human_transport(transport: str) -> str:
-    if transport == "openai":
-        return "OpenAI Responses API"
-    if transport == "codex":
-        return "Codex CLI"
-    return transport
+    """Display label for a transport; unknown values pass through verbatim."""
+    return _TRANSPORT_LABELS.get(transport, transport)
 
 
 # --- Round-trip self-check (used by drift detection) -------------------------

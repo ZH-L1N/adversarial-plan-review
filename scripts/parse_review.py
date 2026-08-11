@@ -170,6 +170,35 @@ def parse_openai_response(
     except json.JSONDecodeError as exc:
         raise ReviewSchemaError(f"OpenAI response is not valid JSON: {exc}") from exc
 
+    return _review_result_from_parsed(
+        parsed,
+        raw_response_text=raw_response_text,
+        round_n=round_n,
+        transport="openai",
+        model=model,
+        usage_input_tokens=usage_input_tokens,
+        usage_output_tokens=usage_output_tokens,
+        cost_usd=cost_usd,
+    )
+
+
+def _review_result_from_parsed(
+    parsed: Any,
+    *,
+    raw_response_text: str,
+    round_n: int,
+    transport: str,
+    model: str,
+    usage_input_tokens: int,
+    usage_output_tokens: int,
+    cost_usd: float,
+) -> ReviewResult:
+    """Validate a decoded reviewer payload and build the `ReviewResult`.
+
+    Shared by the openai and claude paths so both get byte-identical schema +
+    cross-field-invariant enforcement (and therefore the same `ReviewSchemaError`
+    → retry-once behavior at the caller layer, v2-plan D20).
+    """
     _validate_review_schema(parsed)
     validate_review_invariants(parsed)
 
@@ -190,7 +219,7 @@ def parse_openai_response(
         findings=findings,
         open_questions=open_questions,
         raw_response_text=raw_response_text,
-        transport="openai",
+        transport=transport,
         model=model,
         usage=ReviewUsage(
             tokens_input=usage_input_tokens,
@@ -198,6 +227,127 @@ def parse_openai_response(
             cost_usd=cost_usd,
         ),
     )
+
+
+# --- Claude CLI parser --------------------------------------------------------
+
+
+_JSON_FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
+
+
+def parse_claude_response(
+    raw_response_text: str,
+    *,
+    round_n: int,
+    model: str,
+    usage_input_tokens: int = 0,
+    usage_output_tokens: int = 0,
+    cost_usd: float = 0.0,
+) -> ReviewResult:
+    """Parse the `result` text of a `claude -p --output-format json` envelope.
+
+    The CLI has no server-side schema enforcement, so the JSON may arrive fenced
+    or wrapped in prose (a repo-verifying reviewer likes to narrate). We strip
+    fences / extract the outermost `{…}` defensively, then run the SAME
+    validation the openai path uses. Malformed output raises `ReviewSchemaError`
+    so the existing retry-once policy (D20) applies unchanged.
+    """
+    candidate = _extract_json_object(raw_response_text)
+    if candidate is None:
+        raise ReviewSchemaError(
+            "Claude response contains no parseable JSON object (checked fenced "
+            "blocks last-first, then the whole text); cannot parse reviewer output"
+        )
+    # `_extract_json_object` only returns spans that already decoded cleanly.
+    parsed = json.loads(candidate)
+
+    return _review_result_from_parsed(
+        parsed,
+        # Keep the verbatim text: the fixes-md audit block must show exactly what
+        # the reviewer said, prose and suppressed-count line included.
+        raw_response_text=raw_response_text,
+        round_n=round_n,
+        transport="claude",
+        model=model,
+        usage_input_tokens=usage_input_tokens,
+        usage_output_tokens=usage_output_tokens,
+        cost_usd=cost_usd,
+    )
+
+
+def _extract_json_object(text: str) -> str | None:
+    """Best-effort extraction of a single **decodable** JSON object from model output.
+
+    Order: fenced blocks **last-first**, then a brace-depth scan of the whole
+    text. Every candidate must `json.loads` cleanly to be accepted; returns None
+    when none does.
+
+    All three choices are hardening against a narrating repo-verifying reviewer:
+
+    - It emits *earlier* fenced blocks — the probe output and code excerpts that
+      justify its findings — before the verdict fence. Taking the FIRST fence
+      would parse a `git diff` excerpt as the review.
+    - It also emits *later* evidence fences, AFTER the verdict, and those carry
+      braces of their own (`awk '{print $1}'`, a `jq` filter). Accepting the
+      last fence's balanced span unconditionally let such a fence shadow the
+      real verdict and killed the round; validating each candidate makes the
+      search fall back to the earlier fence that actually parses.
+    - It appends text after the verdict (`suppressed: N below-bar
+      observations`), sometimes containing a stray `}`. The old `rfind('}')`
+      span extended to that brace and produced invalid JSON; a depth scan stops
+      at the object's real close.
+    """
+    for fenced in reversed(_JSON_FENCE.findall(text)):
+        candidate = _decodable_object_span(fenced)
+        if candidate is not None:
+            return candidate
+    return _decodable_object_span(text)
+
+
+def _decodable_object_span(text: str) -> str | None:
+    """`_balanced_object_span`, but None unless the span is valid JSON."""
+    candidate = _balanced_object_span(text)
+    if candidate is None:
+        return None
+    try:
+        json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+    return candidate
+
+
+def _balanced_object_span(text: str) -> str | None:
+    """Return the first balanced `{…}` span in `text`, or None.
+
+    String-aware (a `}` inside a JSON string value doesn't close the object) and
+    escape-aware. Returns None when no `{` exists or the object never closes.
+    """
+    start = text.find("{")
+    if start == -1:
+        return None
+
+    depth = 0
+    in_string = False
+    escaped = False
+    for i in range(start, len(text)):
+        char = text[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return None
 
 
 def _validate_review_schema(parsed: Any) -> None:

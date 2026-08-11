@@ -236,6 +236,32 @@ def test_invalid_transport_rejected(schema, make_sidecar_factory):
         _validate(schema, sidecar)
 
 
+@pytest.mark.parametrize("transport", ["openai", "codex", "claude"])
+def test_supported_transports_validate(schema, make_sidecar_factory, transport):
+    """R1-H2: without "claude" in the enum, the FIRST sidecar write of a claude
+    round hard-fails on any machine with jsonschema installed."""
+    sidecar = make_sidecar_factory(
+        round_n=1, plan_content="# x", baseline_plan_content="# y",
+        transport=transport,
+    )
+    _validate(schema, sidecar)
+
+
+def test_unknown_transport_still_rejected_after_widening(schema, make_sidecar_factory):
+    """Widening the enum must not turn it into a free-form string."""
+    sidecar = make_sidecar_factory(
+        round_n=1, plan_content="# x", baseline_plan_content="# y",
+    )
+    sidecar["transport"] = "gemini"
+    with pytest.raises(jsonschema.ValidationError):
+        _validate(schema, sidecar)
+
+
+def test_schema_title_records_the_minor_bump(schema):
+    """Enum widening = backward-compatible minor bump (repo convention)."""
+    assert "v2.1.0" in schema["title"]
+
+
 def test_invalid_severity_rejected(schema, make_sidecar_factory):
     sidecar = make_sidecar_factory(
         round_n=1, plan_content="# x", baseline_plan_content="# y",

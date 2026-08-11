@@ -34,6 +34,7 @@ from _dotenv import load_local_env
 from reviewer import (
     TransportSelection,
     TransportUnavailableError,
+    _is_claude_cli_available,
     detect_transport,
 )
 
@@ -46,7 +47,7 @@ load_local_env()
 
 
 class FirstRunRequired(RuntimeError):
-    """Neither OpenAI key nor Codex CLI is available; SKILL.md must prompt."""
+    """No transport (OpenAI key / Claude CLI / Codex CLI); SKILL.md must prompt."""
 
 
 # --- Dataclasses -------------------------------------------------------------
@@ -57,10 +58,26 @@ class FirstRunStatus:
     transport: TransportSelection | None
     has_openai_key: bool
     has_codex: bool
+    # Defaulted so existing callers constructing the three-field form still
+    # work; `check_or_prompt` always populates it.
+    has_claude: bool = False
 
     @property
     def ready(self) -> bool:
+        """True when ANY transport is usable — openai, claude, or codex."""
         return self.transport is not None
+
+    @property
+    def available_transports(self) -> list[str]:
+        """Names of every transport that could serve, in detection order."""
+        found = []
+        if self.has_openai_key:
+            found.append("openai")
+        if self.has_claude:
+            found.append("claude")
+        if self.has_codex:
+            found.append("codex")
+        return found
 
 
 # --- Public surface ----------------------------------------------------------
@@ -76,6 +93,9 @@ def check_or_prompt(*, env: dict[str, str] | None = None) -> FirstRunStatus:
     env = dict(os.environ if env is None else env)
     has_openai_key = bool(env.get("OPENAI_API_KEY"))
     has_codex = _is_codex_cli_available(env)
+    # Reuse reviewer.py's hermetic PATH walk rather than a second copy: the
+    # availability answer here MUST match the one detect_transport acted on.
+    has_claude = _is_claude_cli_available(env)
     try:
         selection = detect_transport(env=env)
     except TransportUnavailableError as exc:
@@ -85,6 +105,7 @@ def check_or_prompt(*, env: dict[str, str] | None = None) -> FirstRunStatus:
         transport=selection,
         has_openai_key=has_openai_key,
         has_codex=has_codex,
+        has_claude=has_claude,
     )
 
 
@@ -141,15 +162,27 @@ def setup_guide_text() -> str:
         "     (the file is gitignored by this skill's `.gitignore`)\n"
         "  4. Re-run the skill.\n"
         "\n"
-        "Option 2 — Codex CLI (legacy fallback; no severity tagging):\n"
+        "Option 2 — Claude Code CLI (auto-fallback; repo-verifying reviewer):\n"
+        "  1. Install Claude Code and log in — your existing subscription is\n"
+        "     enough; there is NO API key to provision.\n"
+        "  2. Re-run this skill — it picks up `claude` from PATH automatically\n"
+        "     whenever OPENAI_API_KEY is unset.\n"
+        "  3. Set `ADVERSARIAL_TRANSPORT=claude` to force it even when an\n"
+        "     OpenAI key is configured.\n"
+        "     The reviewer subprocess runs settings-isolated inside your repo\n"
+        "     with a read-mostly tool floor, so it can verify the plan against\n"
+        "     the actual files — see README.md for the containment contract.\n"
+        "\n"
+        "Option 3 — Codex CLI (legacy fallback; no severity tagging):\n"
         "  1. Install via https://github.com/openai/codex\n"
         "  2. Run `codex login` to authenticate against your ChatGPT account\n"
         "  3. Re-run this skill — it will pick up the CLI automatically.\n"
         "\n"
-        "Either path works; the OpenAI one is preferred for v2 because it gives\n"
-        "the reviewer schema-validated severity tags and lets the loop's\n"
-        "severity-gated exit (Phase 4) terminate cleanly when no high-severity\n"
-        "findings remain.\n"
+        "Any path works. OpenAI is the default because strict structured\n"
+        "outputs make severity tagging reliable, which is what lets the loop's\n"
+        "severity-gated exit terminate cleanly. Claude is the preferred\n"
+        "fallback (it outranks Codex) because it validates severity by retry\n"
+        "and can open the repo files the plan cites.\n"
     )
 
 
@@ -238,6 +271,7 @@ def _cli(argv: list[str]) -> int:
         print(
             f"transport ready: {status.transport.name} ({status.transport.reason})"
         )
+        print(f"transports available: {', '.join(status.available_transports) or 'none'}")
         return 0
 
     parser.print_help()

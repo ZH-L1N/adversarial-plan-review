@@ -4,6 +4,10 @@ from __future__ import annotations
 import pytest
 
 from build_reviewer_prompt_v2 import (
+    CLAUDE_FINDING_DISCIPLINE,
+    CLAUDE_OUTPUT_FORMAT,
+    CLAUDE_REPO_VERIFICATION_LATER_ROUNDS,
+    CLAUDE_REPO_VERIFICATION_ROUND_ONE,
     CONSISTENCY_ONLY_INSTRUCTIONS,
     LATER_ROUND_INSTRUCTIONS,
     RECENT_ROUNDS_VERBATIM,
@@ -11,6 +15,7 @@ from build_reviewer_prompt_v2 import (
     ROUND_ONE_INSTRUCTION,
     build_prompt,
 )
+from parse_review import REVIEW_SCHEMA
 
 
 # --- Round 1 -----------------------------------------------------------------
@@ -333,3 +338,201 @@ def test_consistency_only_instructions_constant_narrows_scope():
     assert "CONSISTENCY-ONLY MODE" in CONSISTENCY_ONLY_INSTRUCTIONS
     assert "Do NOT raise new architectural concerns" in CONSISTENCY_ONLY_INSTRUCTIONS
     assert "stale cross-references" in CONSISTENCY_ONLY_INSTRUCTIONS
+
+
+# --- Claude calibration blocks ----------------------------------------------
+
+
+def test_claude_round_1_appends_repo_verification_and_discipline():
+    prompt = build_prompt(
+        plan_text="# x", round_n=1, sidecars=[], plan_diff="", transport="claude"
+    )
+    assert CLAUDE_REPO_VERIFICATION_ROUND_ONE in prompt
+    assert CLAUDE_FINDING_DISCIPLINE in prompt
+    # Round-1 wording: the full verification sweep.
+    assert "open every file it cites" in prompt
+    assert "no full re-sweep" not in prompt
+
+
+def test_claude_later_round_swaps_to_diff_scoped_verification():
+    prompt = build_prompt(
+        plan_text="# x",
+        round_n=2,
+        sidecars=[_sidecar_with_findings(1, [])],
+        plan_diff="@@ ... @@",
+        transport="claude",
+    )
+    assert CLAUDE_REPO_VERIFICATION_LATER_ROUNDS in prompt
+    assert "no full re-sweep" in prompt
+    # The round-1 full-sweep instruction must be gone.
+    assert "open every file it cites" not in prompt
+
+
+def test_claude_discipline_block_states_the_caps():
+    prompt = build_prompt(
+        plan_text="# x", round_n=1, sidecars=[], plan_diff="", transport="claude"
+    )
+    assert "At most 8 findings" in prompt
+    assert "at most 3 `low`" in prompt
+    assert "suppressed: N below-bar observations" in prompt
+    assert "HIGH/MEDIUM are the working currency" in prompt
+
+
+def test_claude_blocks_follow_the_finding_bar():
+    prompt = build_prompt(
+        plan_text="# x", round_n=1, sidecars=[], plan_diff="", transport="claude"
+    )
+    assert prompt.index("</finding_bar>") < prompt.index("<repo_verification>")
+    assert prompt.index("<repo_verification>") < prompt.index("<finding_discipline>")
+
+
+@pytest.mark.parametrize("transport", ["openai", "codex"])
+def test_non_claude_prompts_are_byte_identical_to_the_default(transport):
+    """Regression: the claude calibration must never leak into the other paths."""
+    kwargs = dict(plan_text="# my plan\n\nbody.", sidecars=[], plan_diff="")
+    assert build_prompt(round_n=1, transport=transport, **kwargs) == build_prompt(
+        round_n=1, **kwargs
+    )
+
+    later_kwargs = dict(
+        plan_text="# my plan\n\nbody.",
+        sidecars=[_sidecar_with_findings(1, [_finding(1, 1)])],
+        plan_diff="@@ -1 +1 @@\n-old\n+new",
+        cumulative_cost_usd=0.42,
+    )
+    assert build_prompt(round_n=2, transport=transport, **later_kwargs) == build_prompt(
+        round_n=2, **later_kwargs
+    )
+
+
+@pytest.mark.parametrize("round_n", [1, 2])
+def test_default_transport_carries_no_claude_blocks(round_n):
+    sidecars = [] if round_n == 1 else [_sidecar_with_findings(1, [])]
+    prompt = build_prompt(
+        plan_text="# x", round_n=round_n, sidecars=sidecars, plan_diff=""
+    )
+    assert "<repo_verification>" not in prompt
+    assert "<finding_discipline>" not in prompt
+    # The openai path gets its contract server-side (strict structured outputs);
+    # emitting one in the prompt would break the byte-identity regression above.
+    assert "<output_format>" not in prompt
+
+
+def test_claude_consistency_only_round_keeps_the_discipline_caps():
+    """Consistency-only narrows the instructions, not the volume discipline."""
+    prompt = build_prompt(
+        plan_text="# x",
+        round_n=3,
+        sidecars=[_sidecar_with_findings(1, []), _sidecar_with_findings(2, [])],
+        plan_diff="@@ ... @@",
+        consistency_only_mode=True,
+        transport="claude",
+    )
+    assert "CONSISTENCY-ONLY MODE" in prompt
+    assert CLAUDE_FINDING_DISCIPLINE in prompt
+
+
+def test_cli_transport_flag_emits_claude_blocks(tmp_path, capsys):
+    from build_reviewer_prompt_v2 import _cli
+
+    plan = tmp_path / "v1-x.md"
+    plan.write_text("# plan", encoding="utf-8")
+    exit_code = _cli(
+        [
+            "--plan-file", str(plan),
+            "--round", "1",
+            "--slug", "x",
+            "--version", "v1",
+            "--transport", "claude",
+        ]
+    )
+    assert exit_code == 0
+    assert "<repo_verification>" in capsys.readouterr().out
+
+
+def test_cli_defaults_to_openai_transport(tmp_path, capsys):
+    from build_reviewer_prompt_v2 import _cli
+
+    plan = tmp_path / "v1-x.md"
+    plan.write_text("# plan", encoding="utf-8")
+    assert _cli(
+        ["--plan-file", str(plan), "--round", "1", "--slug", "x", "--version", "v1"]
+    ) == 0
+    assert "<repo_verification>" not in capsys.readouterr().out
+
+
+# --- Claude JSON output contract (derived from REVIEW_SCHEMA) ----------------
+
+
+def _required_property_names(schema) -> set[str]:
+    """Every required property name in `schema`, walking nested item schemas."""
+    names: set[str] = set()
+    if not isinstance(schema, dict):
+        return names
+    names.update(schema.get("required") or [])
+    for prop in (schema.get("properties") or {}).values():
+        names |= _required_property_names(prop)
+    items = schema.get("items")
+    if isinstance(items, dict):
+        names |= _required_property_names(items)
+    return names
+
+
+@pytest.mark.parametrize("round_n", [1, 2])
+def test_claude_prompt_states_the_json_output_contract(round_n):
+    """The CLI has NO server-side schema enforcement — the prompt must carry it."""
+    sidecars = [] if round_n == 1 else [_sidecar_with_findings(1, [])]
+    prompt = build_prompt(
+        plan_text="# x",
+        round_n=round_n,
+        sidecars=sidecars,
+        plan_diff="@@ ... @@",
+        transport="claude",
+    )
+    assert "<output_format>" in prompt
+    assert "</output_format>" in prompt
+    assert CLAUDE_OUTPUT_FORMAT in prompt
+    assert "EXACTLY ONE JSON object" in prompt
+    assert "markdown code fences" in prompt
+    # additionalProperties: false semantics must be spelled out, not implied.
+    assert "NO other keys" in prompt
+    assert "additionalProperties: false" in prompt
+
+
+def test_claude_output_contract_names_every_required_schema_field():
+    """Walk REVIEW_SCHEMA: every required property name must reach the reviewer."""
+    prompt = build_prompt(
+        plan_text="# x", round_n=1, sidecars=[], plan_diff="", transport="claude"
+    )
+    required = _required_property_names(REVIEW_SCHEMA)
+    # Guard the guard: the walk must actually reach the nested findings item.
+    assert {"status", "findings", "open_questions", "severity", "concrete_fix"} <= required
+    for name in sorted(required):
+        assert f'"{name}"' in prompt, f"output contract omits required field {name}"
+
+
+def test_claude_output_contract_carries_the_enums_and_types():
+    prompt = build_prompt(
+        plan_text="# x", round_n=1, sidecars=[], plan_diff="", transport="claude"
+    )
+    section = prompt.split("<output_format>")[1].split("</output_format>")[0]
+    for value in ("NO_FINDINGS", "FINDINGS_PRESENT", "high", "medium", "low"):
+        assert f'"{value}"' in section
+    assert "array of string" in section
+    assert "array of objects" in section
+
+
+def test_claude_output_contract_follows_the_discipline_block():
+    """Contract sits last in the calibration run-up, closest to the task."""
+    prompt = build_prompt(
+        plan_text="# x", round_n=1, sidecars=[], plan_diff="", transport="claude"
+    )
+    assert prompt.index("<finding_discipline>") < prompt.index("<output_format>")
+    assert prompt.index("<output_format>") < prompt.index("<full_plan>")
+
+
+def test_claude_output_contract_permits_only_the_suppressed_line_outside_the_object():
+    """`<finding_discipline>` asks for a trailing suppressed-count line — say so."""
+    section = CLAUDE_OUTPUT_FORMAT
+    assert "suppressed: N below-bar observations" in section
+    assert "ONLY text permitted outside the object" in section

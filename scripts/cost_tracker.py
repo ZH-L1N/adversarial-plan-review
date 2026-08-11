@@ -17,10 +17,16 @@ from pathlib import Path
 
 # Per-1M-token rates in USD. Source: v2-plan §3 + April 2026 gpt-5.5 release
 # notes + July 2026 gpt-5.6 launch pricing. Operators on different tiers can
-# override via OPENAI_INPUT_USD_PER_1M / OPENAI_OUTPUT_USD_PER_1M env vars
-# without code changes.
+# override the `gpt*` rows via OPENAI_INPUT_USD_PER_1M /
+# OPENAI_OUTPUT_USD_PER_1M env vars without code changes.
 # Note: gpt-5.6 charges 2x input / 1.5x output on requests >272K input tokens;
 # plan reviews stay far below that, so the standard rates are used here.
+#
+# The `claude-*` rows are the estimate FALLBACK for the claude CLI transport
+# only — that path reads `total_cost_usd` straight off the result envelope
+# (non-zero even on subscription sessions), so these rates are used solely when
+# the field is absent. They must be keyed on the RESOLVED model id from
+# `modelUsage[*].canonicalModel`, never on a CLI alias like `opus`.
 _DEFAULT_RATES: dict[str, tuple[float, float]] = {
     "gpt-5.6-sol": (5.0, 30.0),
     "gpt-5.6": (5.0, 30.0),  # bare alias routes to sol
@@ -31,6 +37,8 @@ _DEFAULT_RATES: dict[str, tuple[float, float]] = {
     "gpt-5.4": (5.0, 30.0),
     "gpt-5": (5.0, 30.0),
     "gpt-5-mini": (1.0, 4.0),
+    "claude-opus-5": (5.0, 25.0),
+    "claude-sonnet-5": (3.0, 15.0),
 }
 
 
@@ -44,11 +52,21 @@ class RoundCost:
 
 
 def estimate_cost_usd(model: str, tokens_input: int, tokens_output: int) -> float:
-    """Estimate USD cost from per-1M rates, with env-var override support."""
+    """Estimate USD cost from per-1M rates, with env-var override support.
+
+    The `OPENAI_*_USD_PER_1M` overrides are an OpenAI billing-tier knob, so the
+    gate ALLOW-lists `gpt*` rather than denying `claude*`: an operator who set
+    them for their OpenAI contract must not silently mis-price a claude round,
+    and the deny-list form leaked on anything that was neither (a bare `opus`
+    CLI alias that escaped model resolution priced at the OpenAI rate). Belt and
+    braces with `reviewer.CLAUDE_MODEL_ALIASES`, which keeps the alias from
+    reaching this function in the first place.
+    """
     input_rate_env = os.environ.get("OPENAI_INPUT_USD_PER_1M")
     output_rate_env = os.environ.get("OPENAI_OUTPUT_USD_PER_1M")
+    env_override_applies = model.startswith("gpt")
 
-    if input_rate_env and output_rate_env:
+    if env_override_applies and input_rate_env and output_rate_env:
         input_rate = float(input_rate_env)
         output_rate = float(output_rate_env)
     else:

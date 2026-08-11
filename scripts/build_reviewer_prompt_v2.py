@@ -27,6 +27,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from parse_review import REVIEW_SCHEMA
+
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -77,6 +79,123 @@ sound, return status="NO_FINDINGS" with empty findings AND empty open_questions.
 """
 
 
+# --- Claude-transport calibration blocks -------------------------------------
+#
+# Appended after ROLE (i.e. after `<finding_bar>`) for `transport="claude"` ONLY
+# — the openai/codex prompts stay byte-identical, pinned by a regression test.
+# The third claude-only block, `<output_format>`, is built further down from
+# `REVIEW_SCHEMA`.
+#
+# Why they exist: post-hoc analysis of 68 review rounds found the Claude
+# reviewer's edge is repo access (all 5 of its round-1 HIGHs required opening
+# repo files — a defect class a text-only transport structurally cannot see),
+# and its weakness is volume (12 findings in round 1 vs GPT's historical 3–6,
+# with 3–5 lows/round where the churn lived). These two blocks keep the
+# capability and import the discipline.
+
+CLAUDE_REPO_VERIFICATION_ROUND_ONE = """<repo_verification>
+You run inside the plan's repo with Read/Grep/Glob/Bash. Verify the plan against
+reality: open every file it cites, check named fixtures/helpers/config keys
+exist, lint-probe embedded code against the repo's actual linter config, verify
+the library versions its claims depend on. Repo claims require
+personally-verified `file:line` (or probe-output) evidence. Clean up scratch
+files; never modify tracked files; never run git write commands.
+</repo_verification>"""
+
+
+CLAUDE_REPO_VERIFICATION_LATER_ROUNDS = """<repo_verification>
+Verify prior-round resolutions in the plan diff, then hunt only for new
+implementation-breaking defects — no full re-sweep.
+</repo_verification>"""
+
+
+CLAUDE_FINDING_DISCIPLINE = """<finding_discipline>
+At most 8 findings, ranked by impact; at most 3 `low`; count anything below the
+bar in a final `suppressed: N below-bar observations` line rather than reporting
+it. HIGH/MEDIUM are the working currency; `low` only when it still changes
+implementation outcome.
+</finding_discipline>"""
+
+
+# --- Claude JSON output contract ---------------------------------------------
+#
+# The openai path gets its contract enforced server-side (strict structured
+# outputs built from `REVIEW_SCHEMA`); the claude CLI has NOTHING, so the prompt
+# must state it or `parse_claude_response` is left guessing at free-form prose.
+#
+# The block is DERIVED from `REVIEW_SCHEMA` at import time — field names, types,
+# enums and the `additionalProperties: false` semantics all come from the
+# validator itself, so the prompt cannot drift from what the parser accepts.
+
+
+def _schema_type_label(prop_schema: dict[str, Any]) -> str:
+    """Human-readable type for one property, including a closed enum."""
+    type_name = str(prop_schema.get("type", "any"))
+    enum = prop_schema.get("enum")
+    if enum:
+        return f"{type_name} — one of {' | '.join(json.dumps(v) for v in enum)}"
+    if type_name == "array":
+        items = prop_schema.get("items") or {}
+        item_type = str(items.get("type", "any"))
+        plural = "objects" if item_type == "object" else item_type
+        return f"array of {plural} (may be empty)"
+    return type_name
+
+
+def _object_contract_lines(schema: dict[str, Any], *, subject: str) -> list[str]:
+    """Render one object schema as prompt bullets: key names, types, closedness."""
+    properties: dict[str, Any] = schema.get("properties") or {}
+    required = list(schema.get("required") or [])
+    closed_suffix = (
+        " and NO other keys (additionalProperties: false)"
+        if schema.get("additionalProperties") is False
+        else ""
+    )
+    lines = [f"{subject} — these {len(properties)} keys{closed_suffix}:"]
+    for name, prop in properties.items():
+        optional_suffix = "" if name in required else " (optional)"
+        lines.append(f'- "{name}": {_schema_type_label(prop)}{optional_suffix}')
+    return lines
+
+
+def _render_claude_output_format() -> str:
+    lines = [
+        "<output_format>",
+        "Return EXACTLY ONE JSON object and nothing else — no preamble, no",
+        "summary, no praise, and no markdown code fences around it. Emit every",
+        "key listed below, empty arrays included, unless it is tagged (optional).",
+        "",
+    ]
+    lines.extend(_object_contract_lines(REVIEW_SCHEMA, subject="Top-level object"))
+    for name, prop in (REVIEW_SCHEMA.get("properties") or {}).items():
+        items = prop.get("items")
+        if (
+            prop.get("type") == "array"
+            and isinstance(items, dict)
+            and items.get("type") == "object"
+        ):
+            lines.append("")
+            lines.extend(
+                _object_contract_lines(items, subject=f'Each object in "{name}"')
+            )
+    lines.extend(
+        [
+            "",
+            'Cross-field invariants: status "NO_FINDINGS" requires findings AND',
+            'open_questions to BOTH be empty; status "FINDINGS_PRESENT" requires',
+            "at least one finding OR one open question.",
+            "",
+            "The ONLY text permitted outside the object is the single trailing",
+            "`suppressed: N below-bar observations` line from <finding_discipline>.",
+            "</output_format>",
+        ]
+    )
+    return "\n".join(lines)
+
+
+CLAUDE_OUTPUT_FORMAT = _render_claude_output_format()
+
+
 ROUND_ONE_INSTRUCTION = "Review this plan."
 
 
@@ -124,6 +243,7 @@ def build_prompt(
     plan_diff_is_recovered_from_git: bool = False,
     consistency_only_mode: bool = False,
     cumulative_cost_usd: float = 0.0,
+    transport: str = "openai",
 ) -> str:
     """Build the reviewer prompt for round N.
 
@@ -140,8 +260,14 @@ def build_prompt(
             from the plan-bloat warning (§5.5.1). Replaces the verify-then-
             attack instructions with the narrow scrub-only spec.
         cumulative_cost_usd: Running total for the prior-rounds-summary block.
+        transport: Active reviewer transport. `"claude"` appends the
+            repo-verification + finding-discipline calibration blocks and the
+            `REVIEW_SCHEMA`-derived output contract; every other value
+            (including the `"openai"` default and `"codex"`) produces the
+            byte-identical pre-claude prompt.
     """
     sections: list[str] = [ROLE]
+    sections.extend(_claude_calibration_blocks(transport=transport, round_n=round_n))
 
     if round_n == 1:
         sections.append(_full_plan_block(plan_text))
@@ -166,6 +292,18 @@ def build_prompt(
 
 
 # --- Prompt section builders -------------------------------------------------
+
+
+def _claude_calibration_blocks(*, transport: str, round_n: int) -> list[str]:
+    """The claude-only calibration sections, or `[]` for every other transport."""
+    if transport != "claude":
+        return []
+    repo_verification = (
+        CLAUDE_REPO_VERIFICATION_ROUND_ONE
+        if round_n == 1
+        else CLAUDE_REPO_VERIFICATION_LATER_ROUNDS
+    )
+    return [repo_verification, CLAUDE_FINDING_DISCIPLINE, CLAUDE_OUTPUT_FORMAT]
 
 
 def _full_plan_block(plan_text: str) -> str:
@@ -401,6 +539,16 @@ def _cli(argv: list[str]) -> int:
         default=0.0,
         help="Running cumulative cost for the prior-rounds-summary block",
     )
+    parser.add_argument(
+        "--transport",
+        choices=["openai", "codex", "claude"],
+        default="openai",
+        help=(
+            "Active reviewer transport. 'claude' appends the repo-verification "
+            "+ finding-discipline calibration blocks and the JSON output "
+            "contract; openai/codex are identical."
+        ),
+    )
     args = parser.parse_args(argv)
 
     if not args.plan_file.exists():
@@ -431,6 +579,7 @@ def _cli(argv: list[str]) -> int:
         plan_diff_is_recovered_from_git=args.diff_recovered_from_git,
         consistency_only_mode=args.consistency_only,
         cumulative_cost_usd=args.cumulative_cost_usd,
+        transport=args.transport,
     )
     sys.stdout.write(prompt)
     return 0

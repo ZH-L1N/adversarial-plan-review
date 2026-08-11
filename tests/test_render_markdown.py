@@ -4,6 +4,7 @@ from __future__ import annotations
 import pytest
 
 from render_markdown import (
+    _human_transport,
     is_byte_stable,
     render_full_fixes_md,
     render_header,
@@ -329,6 +330,31 @@ def test_render_header_codex_label():
         transport="codex", model="gpt-5.5",
     )
     assert "Codex CLI (gpt-5.5)" in header
+
+
+def test_render_header_claude_label():
+    """The claude transport had no label, so the header read a bare `claude`."""
+    header = render_header(
+        slug="x", version="v1", started_at="2026-05-03T00:00:00Z",
+        transport="claude", model="claude-opus-5",
+    )
+    assert "Claude Code CLI (claude-opus-5)" in header
+
+
+def test_render_round_stats_uses_the_claude_label(make_sidecar_factory):
+    sidecar = make_sidecar_factory(
+        round_n=1, plan_content="# plan", baseline_plan_content="# base",
+        findings=[_make_finding(1, 1)],
+    )
+    sidecar["transport"] = "claude"
+    sidecar["model"] = "claude-opus-5"
+    md = render_round(sidecar)
+    assert "Reviewer: Claude Code CLI (claude-opus-5)" in md
+    assert "### Reviewer findings (Claude Code CLI)" in md
+
+
+def test_human_transport_passes_unknown_values_through():
+    assert _human_transport("some-future-transport") == "some-future-transport"
 
 
 # --- render_full_fixes_md ---------------------------------------------------

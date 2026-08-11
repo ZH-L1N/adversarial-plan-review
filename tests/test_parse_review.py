@@ -13,6 +13,7 @@ from parse_review import (
     ReviewSchemaError,
     assign_open_question_ids,
     infer_severity,
+    parse_claude_response,
     parse_codex_prose,
     parse_openai_response,
     validate_review_invariants,
@@ -151,6 +152,191 @@ def test_parse_openai_response_non_string_field_raises():
     )
     with pytest.raises(ReviewSchemaError, match="must be a string"):
         parse_openai_response(bad, round_n=1, model="gpt-5.5")
+
+
+# --- Claude CLI parser (defensive JSON extraction + shared validation) -------
+
+
+def test_parse_claude_response_clean_json(canned_openai_findings_present):
+    result = parse_claude_response(
+        canned_openai_findings_present, round_n=2, model="claude-opus-5"
+    )
+    assert result.status == "FINDINGS_PRESENT"
+    assert len(result.findings) == 2
+    assert result.transport == "claude"
+    assert result.model == "claude-opus-5"
+    assert result.open_questions[0].id == "oq_r2_1"
+
+
+def test_parse_claude_response_strips_code_fences(canned_openai_no_findings):
+    fenced = f"```json\n{canned_openai_no_findings}\n```"
+    result = parse_claude_response(fenced, round_n=1, model="claude-opus-5")
+    assert result.status == "NO_FINDINGS"
+    # Raw text is preserved verbatim for the fixes-md audit block.
+    assert result.raw_response_text == fenced
+
+
+def test_parse_claude_response_extracts_from_prose_wrapper(canned_openai_no_findings):
+    wrapped = (
+        "I opened every file the plan cites. Here is my verdict:\n\n"
+        f"{canned_openai_no_findings}\n\n"
+        "suppressed: 4 below-bar observations\n"
+    )
+    result = parse_claude_response(wrapped, round_n=1, model="claude-opus-5")
+    assert result.status == "NO_FINDINGS"
+
+
+def test_parse_claude_response_records_usage(canned_openai_no_findings):
+    result = parse_claude_response(
+        canned_openai_no_findings,
+        round_n=1,
+        model="claude-opus-5",
+        usage_input_tokens=38209,
+        usage_output_tokens=500,
+        cost_usd=0.0384,
+    )
+    assert result.usage.tokens_input == 38209
+    assert result.usage.tokens_output == 500
+    assert result.usage.cost_usd == 0.0384
+
+
+def test_parse_claude_response_no_json_raises():
+    with pytest.raises(ReviewSchemaError):
+        parse_claude_response("I could not comply.", round_n=1, model="claude-opus-5")
+
+
+def test_parse_claude_response_schema_violation_raises():
+    """Same validation body as the openai path → same ReviewSchemaError → D20 retry."""
+    bad = json.dumps(
+        {
+            "status": "FINDINGS_PRESENT",
+            "findings": [
+                {
+                    "severity": "blocker",  # not in enum
+                    "category": "X",
+                    "where": "Y",
+                    "what_can_go_wrong": "Z",
+                    "concrete_fix": "W",
+                }
+            ],
+            "open_questions": [],
+        }
+    )
+    with pytest.raises(ReviewSchemaError, match="severity"):
+        parse_claude_response(bad, round_n=1, model="claude-opus-5")
+
+
+def test_parse_claude_response_enforces_cross_field_invariants():
+    bad = json.dumps(
+        {"status": "NO_FINDINGS", "findings": [], "open_questions": ["but why?"]}
+    )
+    with pytest.raises(ReviewSchemaError, match="invariant"):
+        parse_claude_response(bad, round_n=1, model="claude-opus-5")
+
+
+def test_parse_claude_response_prefers_the_last_fenced_block(
+    canned_openai_no_findings,
+):
+    """A repo-verifying reviewer fences its probe evidence BEFORE the verdict."""
+    narrated = (
+        "I grepped the repo and found this in reviewer.py:\n\n"
+        "```python\n"
+        'cmd = ["claude", "-p"]  # {not json}\n'
+        "```\n\n"
+        "Verdict:\n\n"
+        f"```json\n{canned_openai_no_findings}\n```\n"
+    )
+    result = parse_claude_response(narrated, round_n=1, model="claude-opus-5")
+    assert result.status == "NO_FINDINGS"
+
+
+def test_parse_claude_response_ignores_trailing_stray_brace(canned_openai_no_findings):
+    """The old rfind('}') span swallowed narration and produced invalid JSON."""
+    trailing = (
+        f"{canned_openai_no_findings}\n\n"
+        "suppressed: 4 below-bar observations\n"
+        "(one of them concerned the literal `}` in the disallowedTools string)\n"
+    )
+    result = parse_claude_response(trailing, round_n=1, model="claude-opus-5")
+    assert result.status == "NO_FINDINGS"
+
+
+def test_parse_claude_response_tolerates_braces_inside_string_values():
+    """A `}` inside a finding's text must not terminate the object early."""
+    payload = json.dumps(
+        {
+            "status": "FINDINGS_PRESENT",
+            "findings": [
+                {
+                    "severity": "high",
+                    "category": "Containment",
+                    "where": "reviewer.py:120",
+                    "what_can_go_wrong": 'The f-string "{tools}" }} expands wrong.',
+                    "concrete_fix": "Escape the brace.",
+                }
+            ],
+            "open_questions": [],
+        }
+    )
+    result = parse_claude_response(
+        f"Here is my verdict.\n\n{payload}\n\nDone.",
+        round_n=1,
+        model="claude-opus-5",
+    )
+    assert len(result.findings) == 1
+    assert "}}" in result.findings[0].what_can_go_wrong
+
+
+def test_parse_claude_response_unterminated_object_raises():
+    """A truncated response is a schema error (→ D20 retry), not a crash."""
+    with pytest.raises(ReviewSchemaError):
+        parse_claude_response(
+            '{"status": "NO_FINDINGS", "findings": [], "open_que',
+            round_n=1,
+            model="claude-opus-5",
+        )
+
+
+def test_parse_claude_response_falls_back_past_a_json_free_fence(
+    canned_openai_no_findings,
+):
+    """Last-fence-first must skip fences with no object rather than give up."""
+    narrated = (
+        f"```json\n{canned_openai_no_findings}\n```\n\n"
+        "```\nnpm run lint  # clean\n```\n"
+    )
+    result = parse_claude_response(narrated, round_n=1, model="claude-opus-5")
+    assert result.status == "NO_FINDINGS"
+
+
+def test_parse_claude_response_skips_an_unparseable_trailing_evidence_fence(
+    canned_openai_findings_present,
+):
+    """A brace-bearing evidence fence AFTER the verdict must not shadow it.
+
+    Last-fence-first alone isn't enough: the bash fence below yields a balanced
+    `{…}` span that is not JSON. Accepting it (the old behaviour) lost the real
+    verdict; the loop must fall back to the earlier fence that parses.
+    """
+    narrated = (
+        "Verdict:\n\n"
+        f"```json\n{canned_openai_findings_present}\n```\n\n"
+        "Evidence for finding 1:\n\n"
+        "```bash\n"
+        "$ awk '{print $1}' cameras.json\n"
+        'jq -r \'.cameras[] | {name: .name}\' cameras.json\n'
+        "```\n"
+    )
+    result = parse_claude_response(narrated, round_n=2, model="claude-opus-5")
+    assert result.status == "FINDINGS_PRESENT"
+    assert len(result.findings) == 2
+
+
+def test_parse_claude_response_whole_text_fallback_is_validated_too():
+    """No fence parses AND the whole-text span is garbage → schema error, not a crash."""
+    narrated = "```bash\nawk '{print $1}' f\n```\nand then {not: json} happened\n"
+    with pytest.raises(ReviewSchemaError):
+        parse_claude_response(narrated, round_n=1, model="claude-opus-5")
 
 
 # --- Cross-field invariants --------------------------------------------------
