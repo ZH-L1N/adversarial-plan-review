@@ -238,6 +238,11 @@ print(json.dumps({
   'tokens_input': outcome.tokens_input,
   'tokens_output': outcome.tokens_output,
   'cost_usd': outcome.total_cost_usd,
+  # The round's running total, not the round's own cost. Nothing else computes
+  # this: pass the result back as CUMULATIVE_COST next round and persist it in
+  # step 6, or round 2 records round 1's figure.
+  'cumulative_cost_usd': round(CUMULATIVE_COST + outcome.total_cost_usd, 4),
+  'cost_accounting_complete': outcome.cost_complete,
   'attempts': [a.__dict__ for a in outcome.attempts],
   'raw_response_text': outcome.result.raw_response_text,
 }))
@@ -345,6 +350,11 @@ state = RoundState(
     # what cumulative cost, the resume total and the cost cap all read.
     round_usage=ReviewUsage(outcome.tokens_input, outcome.tokens_output,
                             outcome.total_cost_usd),
+    reviewer_attempts=[a.__dict__ for a in outcome.attempts],
+    # False means stats.cost_usd is a known LOWER BOUND. step 7 then forces a
+    # soft-block rather than exiting on a total we know is incomplete.
+    cost_accounting_complete=outcome.cost_complete,
+    cumulative_cost_usd=CUMULATIVE_COST + outcome.total_cost_usd,
     decisions=[PlannerDecision(...) for ...], # one per finding/open-question
     plan_edits=[PlanEdit(...) for ...],       # one per applied edit
     plan_content_at_end=Path('plans/<version>-<slug>.md').read_text(encoding='utf-8'),

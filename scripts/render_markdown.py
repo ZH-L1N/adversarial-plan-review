@@ -42,7 +42,8 @@ def render_header(
         "\n"
         f"- Plan: `plans/{version}-{slug}.md`\n"
         f"- Started: {started_at}\n"
-        f"- Reviewer: {_human_transport(transport)} ({model})\n"
+        f"- Reviewer: {_human_transport(transport)} ({model}) — "
+        f"{reviewer_independence(transport)}\n"
         "- Planner: Claude\n"
         "- Termination rules: severity-gated exit | NO FINDINGS | "
         "ceiling hit | planner-locked | cost-capped (v2; see plans/v2-plan.md §5.4)\n"
@@ -186,7 +187,7 @@ def _render_round_stats(sidecar: dict[str, Any]) -> str:
     return (
         "### Round stats\n"
         "\n"
-        f"- Reviewer: {transport_label} ({model})\n"
+        f"- Reviewer: {transport_label} ({model}) — {independence_of(sidecar)}\n"
         f"- Tokens: {stats['tokens_input']:,} input / {stats['tokens_output']:,} output\n"
         f"- Cost: ${stats['cost_usd']:.4f} (cumulative: ${stats['cumulative_cost_usd']:.4f})\n"
         f"- Severity histogram: high={hist['high']}, medium={hist['medium']}, low={hist['low']}\n"
@@ -253,6 +254,30 @@ _TRANSPORT_LABELS = {
     "claude": "Claude Code CLI",
     "codex": "Codex CLI",
 }
+
+
+# The planner is always Claude. A Claude reviewer therefore has no
+# cross-vendor independence — and this skill's whole premise is that a solo
+# reviewer-planner tends to agree with itself. The claude transport still
+# OUTRANKS codex in auto-detection, because it is the only one that can verify
+# a plan against the repo and its severities are schema-validated rather than
+# keyword-guessed; trading that away for a vendor label would be a worse
+# review. The answer to the trade-off is disclosure, not reordering, so every
+# round records which kind of independence it actually had.
+SAME_VENDOR_TRANSPORTS = frozenset({"claude"})
+
+
+def reviewer_independence(transport: str) -> str:
+    """`"same-vendor"` when the reviewer shares a vendor with the planner."""
+    return "same-vendor" if transport in SAME_VENDOR_TRANSPORTS else "cross-vendor"
+
+
+def independence_of(sidecar: dict) -> str:
+    """Read the recorded label, deriving it for sidecars written before it existed."""
+    recorded = sidecar.get("reviewer_independence")
+    if isinstance(recorded, str) and recorded:
+        return recorded
+    return reviewer_independence(sidecar.get("transport", ""))
 
 
 def _human_transport(transport: str) -> str:

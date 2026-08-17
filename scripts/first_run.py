@@ -27,6 +27,8 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+
+from render_markdown import reviewer_independence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -271,6 +273,19 @@ def _cli(argv: list[str]) -> int:
         print(
             f"transport ready: {status.transport.name} ({status.transport.reason})"
         )
+        # Disclosure, not reordering. The claude transport deliberately
+        # outranks codex — it is the only reviewer that can verify a plan
+        # against the repo — but the planner is also Claude, so this round has
+        # no cross-vendor independence and the operator should not have to
+        # infer that from the transport name.
+        if reviewer_independence(status.transport.name) == "same-vendor":
+            print(
+                "WARNING: same-vendor review — the reviewer and the planner are "
+                "both Claude, so this run does not provide the cross-vendor "
+                "independence this skill is built around. Set OPENAI_API_KEY (or "
+                "ADVERSARIAL_TRANSPORT=codex) for a cross-vendor reviewer.",
+                file=sys.stderr,
+            )
         print(f"transports available: {', '.join(status.available_transports) or 'none'}")
         return 0
 

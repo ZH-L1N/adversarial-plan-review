@@ -1035,3 +1035,32 @@ def test_deferral_to_dict():
 def test_plan_edit_to_dict():
     e = PlanEdit("§5.3", "rewrote selection")
     assert e.to_dict() == {"section": "§5.3", "summary": "rewrote selection"}
+
+
+def test_incomplete_cost_accounting_forces_a_soft_block():
+    """A lower bound must not be treated as a total by the cost gate.
+
+    An unpriceable attempt makes `stats.cost_usd` a known lower bound, so the
+    cap may already have been passed without firing. Exposing the flag without
+    acting on it leaves the gate trusting an incomplete number.
+    """
+    review = _review(status="FINDINGS_PRESENT",
+                     findings=[Finding("medium", "c", "X", "fix", "ev")])
+    state = _state(round_n=2, review=review,
+                   decisions=[PlannerDecision("f_r2_1", "reject", "no")])
+    state.cost_accounting_complete = False
+    # All rejected would normally be planner_locked with no soft-block; but
+    # cost-capped is what we want to exercise, so use an undecided finding.
+    state.decisions = []
+    decision = evaluate_exit(state, cumulative_cost_usd=10.0, cost_cap_usd=5.0)
+    assert decision.reason == ExitReason.COST_CAPPED
+    assert decision.needs_soft_block is True
+
+
+def test_complete_accounting_leaves_the_gate_alone():
+    review = _review(status="NO_FINDINGS")
+    state = _state(round_n=2, review=review)
+    assert state.cost_accounting_complete is True
+    decision = evaluate_exit(state, cumulative_cost_usd=0.5, cost_cap_usd=5.0)
+    assert decision.reason == ExitReason.APPROVED
+    assert decision.needs_soft_block is False

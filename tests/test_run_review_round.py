@@ -20,6 +20,7 @@ from loop_state import (
     RoundState,
     build_sidecar,
     take_initial_snapshot,
+    validate_sidecar,
     write_sidecar_atomic,
 )
 from parse_review import (
@@ -28,6 +29,7 @@ from parse_review import (
     ReviewSchemaError,
     ReviewUsage,
 )
+from render_markdown import render_round
 from reviewer import QuotaExhaustedError, TransportError, TransportSelection
 
 SLUG, VERSION = "demo", "v0.1"
@@ -463,3 +465,103 @@ def test_round_totals_reach_the_sidecar_not_just_the_winner(repo, monkeypatch):
 
     assert sidecar["stats"]["cost_usd"] == pytest.approx(0.65)
     assert sidecar["stats"]["cost_usd"] != outcome.result.usage.cost_usd
+
+
+def test_cumulative_cost_accumulates_across_rounds(repo, monkeypatch):
+    """Round 2's cumulative must include round 1's, not restate the round total.
+
+    The earlier integration test only covered round 1 and set cumulative to the
+    round total, so a stale round-2 figure would have slipped past it.
+    """
+    monkeypatch.setattr(rrr, "invoke_reviewer", lambda p, **k: _result(cost=0.30))
+    prior_cumulative = 0.25  # what round 1 left behind
+
+    outcome = rrr.run_review_round(
+        repo_root=repo, slug=SLUG, version=VERSION, round_n=2,
+        selection=TransportSelection("claude", "Claude CLI on PATH", source="claude_path"),
+        cumulative_cost_usd=prior_cumulative,
+    )
+
+    state = RoundState(
+        round_n=2, slug=SLUG, version=VERSION,
+        transport=outcome.transport, model=outcome.result.model,
+        started_at="2026-08-16T00:02:00Z", completed_at="2026-08-16T00:03:00Z",
+        reviewer_response=outcome.result,
+        round_usage=ReviewUsage(
+            outcome.tokens_input, outcome.tokens_output, outcome.total_cost_usd
+        ),
+        reviewer_attempts=[a.__dict__ for a in outcome.attempts],
+        cost_accounting_complete=outcome.cost_complete,
+        cumulative_cost_usd=prior_cumulative + outcome.total_cost_usd,
+        plan_content_at_end=PLAN_R2,
+    )
+    sidecar = build_sidecar(state, raw_response_text="{}")
+
+    assert sidecar["stats"]["cost_usd"] == pytest.approx(0.30)       # this round
+    assert sidecar["stats"]["cumulative_cost_usd"] == pytest.approx(0.55)  # running
+    assert sidecar["stats"]["cumulative_cost_usd"] != sidecar["stats"]["cost_usd"]
+
+
+def test_attempt_ledger_survives_serialization(repo, monkeypatch):
+    """The sidecar must be able to explain its own cost figure."""
+    seq = [
+        TransportError("truncated", kind="max_turns", cost_usd=0.40, tokens_input=800),
+        _result(cost=0.25),
+    ]
+
+    def fake_invoke(prompt, **kwargs):
+        item = seq.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    monkeypatch.setattr(rrr, "invoke_reviewer", fake_invoke)
+    outcome = rrr.run_review_round(
+        repo_root=repo, slug=SLUG, version=VERSION, round_n=1,
+        selection=TransportSelection("claude", "Claude CLI on PATH", source="claude_path"),
+    )
+    state = RoundState(
+        round_n=1, slug=SLUG, version=VERSION,
+        transport=outcome.transport, model=outcome.result.model,
+        started_at="2026-08-16T00:00:00Z", completed_at="2026-08-16T00:01:00Z",
+        reviewer_response=outcome.result,
+        round_usage=ReviewUsage(
+            outcome.tokens_input, outcome.tokens_output, outcome.total_cost_usd
+        ),
+        reviewer_attempts=[a.__dict__ for a in outcome.attempts],
+        plan_content_at_end=PLAN_R1, baseline_plan_content=PLAN_R1,
+    )
+    sidecar = build_sidecar(state, raw_response_text="{}")
+    validate_sidecar(sidecar)
+
+    ledger = sidecar["reviewer_attempts"]
+    assert [(a["transport"], a["outcome"]) for a in ledger] == [
+        ("claude", "max_turns"), ("claude", "success"),
+    ]
+    assert sum(a["cost_usd"] for a in ledger) == pytest.approx(
+        sidecar["stats"]["cost_usd"]
+    )
+
+
+def test_same_vendor_reviewer_is_recorded_in_the_sidecar(repo, monkeypatch):
+    """A Claude reviewer under a Claude planner has no cross-vendor independence.
+
+    The transport ordering deliberately keeps claude ahead of codex; the answer
+    to that trade-off is disclosure, so every round records which it had.
+    """
+    monkeypatch.setattr(rrr, "invoke_reviewer", lambda p, **k: _result(cost=0.1))
+    outcome = rrr.run_review_round(
+        repo_root=repo, slug=SLUG, version=VERSION, round_n=1,
+        selection=TransportSelection("claude", "Claude CLI on PATH", source="claude_path"),
+    )
+    state = RoundState(
+        round_n=1, slug=SLUG, version=VERSION,
+        transport=outcome.transport, model=outcome.result.model,
+        started_at="2026-08-16T00:00:00Z", completed_at="2026-08-16T00:01:00Z",
+        reviewer_response=outcome.result,
+        plan_content_at_end=PLAN_R1, baseline_plan_content=PLAN_R1,
+    )
+    sidecar = build_sidecar(state, raw_response_text="{}")
+    validate_sidecar(sidecar)
+    assert sidecar["reviewer_independence"] == "same-vendor"
+    assert "same-vendor" in render_round(sidecar)

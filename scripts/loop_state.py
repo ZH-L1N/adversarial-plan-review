@@ -143,6 +143,16 @@ class RoundState:
     # read what lands in the sidecar. Set from `RoundRunOutcome`; when None the
     # winning call is the whole round and its usage is used verbatim.
     round_usage: ReviewUsage | None = None
+    # Per-attempt breakdown from `RoundRunOutcome.attempts`. The aggregate in
+    # `round_usage` says WHAT the round cost; this says which retries and
+    # fallback produced it, without which the authoritative audit artifact
+    # cannot explain its own number.
+    reviewer_attempts: list[dict[str, Any]] | None = None
+    # False when an attempt could not be priced at all. `cumulative_cost_usd`
+    # is then a known LOWER BOUND, not a total — so the cost gate must not
+    # treat it as complete. Exposing the flag without acting on it would leave
+    # the gate trusting a lower bound, which is the same defect one layer up.
+    cost_accounting_complete: bool = True
     cumulative_cost_usd: float = 0.0
     duration_seconds: float = 0.0
     plan_size_delta: int = 0
@@ -398,6 +408,11 @@ def build_sidecar(state: RoundState, *, raw_response_text: str) -> dict[str, Any
         "started_at": state.started_at,
         "completed_at": state.completed_at,
         "transport": state.transport,
+        # From the transport that ACTUALLY produced the verdict — after a quota
+        # fallback that is claude, not the openai selection the round began on.
+        "reviewer_independence": render_markdown.reviewer_independence(state.transport),
+        "reviewer_attempts": state.reviewer_attempts,
+        "cost_accounting_complete": state.cost_accounting_complete,
         "model": state.model,
         "raw_response_text": raw_response_text,
         "plan_content_sha256": plan_sha,
@@ -757,12 +772,16 @@ def evaluate_exit(
             )
 
     has_open = bool(open_highs or open_mediums or open_questions)
+    # A round with an unpriceable attempt reports a lower bound, so the cap may
+    # already have been passed without firing. Surface it rather than exiting
+    # on a number we know is incomplete.
+    accounting_incomplete = not state.cost_accounting_complete
 
     # Branches 4 and 5 end the loop, so they inherit the RESOLVED accept guard:
     # a round whose findings were all accepted has zero OPEN items, and gating
     # the soft-block on `has_open` alone let it exit silently on a plan no
     # reviewer had read. Rare at a ceiling of 20, ordinary at 5.
-    exit_needs_block = has_open or has_accepts
+    exit_needs_block = has_open or has_accepts or accounting_incomplete
 
     # 4. Cost-cap exit (forces user input via soft-block when items remain)
     if cumulative_cost_usd >= cost_cap_usd:

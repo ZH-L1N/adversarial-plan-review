@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://zh-l1n.github.io/adversarial-plan-review/sidecar_schema.json",
-  "title": "Adversarial Plan Review — Round Sidecar (v2.1.0)",
-  "description": "Per-round JSON sidecar. Authoritative source of truth for the loop state machine. The markdown fixes-md is rendered FROM this. See plans/v2-plan.md §5.7. v2.1.0 widened the `transport` enum with \"claude\" (enum widening is backward-compatible for old readers).",
+  "title": "Adversarial Plan Review \u2014 Round Sidecar (v2.1.0)",
+  "description": "Per-round JSON sidecar. Authoritative source of truth for the loop state machine. The markdown fixes-md is rendered FROM this. See plans/v2-plan.md \u00a75.7. v2.1.0 widened the `transport` enum with \"claude\" (enum widening is backward-compatible for old readers).",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -29,55 +29,154 @@
       "type": "string",
       "pattern": "^\\d+\\.\\d+\\.\\d+$"
     },
-    "round": {"type": "integer", "minimum": 1},
-    "started_at": {"type": "string"},
-    "completed_at": {"type": "string"},
-    "transport": {"type": "string", "enum": ["openai", "codex", "claude"]},
-    "model": {"type": "string"},
-    "raw_response_text": {"type": "string"},
-    "plan_content_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-    "plan_content": {"type": "string"},
-    "baseline_plan_content_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
-    "baseline_plan_content": {"type": ["string", "null"]},
+    "round": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "started_at": {
+      "type": "string"
+    },
+    "completed_at": {
+      "type": "string"
+    },
+    "transport": {
+      "type": "string",
+      "enum": [
+        "openai",
+        "codex",
+        "claude"
+      ]
+    },
+    "model": {
+      "type": "string"
+    },
+    "raw_response_text": {
+      "type": "string"
+    },
+    "plan_content_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "plan_content": {
+      "type": "string"
+    },
+    "baseline_plan_content_sha256": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "baseline_plan_content": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "restart_metadata": {
-      "type": ["object", "null"],
+      "type": [
+        "object",
+        "null"
+      ],
       "additionalProperties": false,
-      "required": ["timestamp", "deleted_files", "user_decision"],
+      "required": [
+        "timestamp",
+        "deleted_files",
+        "user_decision"
+      ],
       "properties": {
-        "timestamp": {"type": "string"},
+        "timestamp": {
+          "type": "string"
+        },
         "deleted_files": {
           "type": "array",
-          "items": {"type": "string"}
+          "items": {
+            "type": "string"
+          }
         },
-        "user_decision": {"type": "string"},
+        "user_decision": {
+          "type": "string"
+        },
         "previous_run_summary": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["last_round", "last_status"],
+          "required": [
+            "last_round",
+            "last_status"
+          ],
           "properties": {
-            "last_round": {"type": "integer"},
-            "last_status": {"type": "string"}
+            "last_round": {
+              "type": "integer"
+            },
+            "last_status": {
+              "type": "string"
+            }
           }
         }
       }
     },
     "deferrals_at_exit": {
-      "type": ["array", "null"],
+      "type": [
+        "array",
+        "null"
+      ],
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["item_id", "severity", "reason", "target_version"],
+        "required": [
+          "item_id",
+          "severity",
+          "reason",
+          "target_version"
+        ],
         "properties": {
-          "item_id": {"type": "string"},
-          "severity": {"type": "string", "enum": ["high", "medium", "low", "open_question"]},
-          "reason": {"type": "string", "minLength": 1},
-          "target_version": {"type": ["string", "null"]}
+          "item_id": {
+            "type": "string"
+          },
+          "severity": {
+            "type": "string",
+            "enum": [
+              "high",
+              "medium",
+              "low",
+              "open_question"
+            ]
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1
+          },
+          "target_version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
         },
         "allOf": [
           {
             "comment": "Mediums REQUIRE non-null target_version (round-13 finding 1; round-14 finding 1 sentinel rule). The accept_all_risk branch uses the sentinel string 'accepted-at-exit' so the rule is satisfied uniformly.",
-            "if": {"properties": {"severity": {"const": "medium"}}, "required": ["severity"]},
-            "then": {"properties": {"target_version": {"type": "string", "minLength": 1}}, "required": ["target_version"]}
+            "if": {
+              "properties": {
+                "severity": {
+                  "const": "medium"
+                }
+              },
+              "required": [
+                "severity"
+              ]
+            },
+            "then": {
+              "properties": {
+                "target_version": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "required": [
+                "target_version"
+              ]
+            }
           }
         ]
       }
@@ -85,22 +184,56 @@
     "reviewer_response": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["status", "findings", "open_questions"],
+      "required": [
+        "status",
+        "findings",
+        "open_questions"
+      ],
       "properties": {
-        "status": {"type": "string", "enum": ["NO_FINDINGS", "FINDINGS_PRESENT"]},
+        "status": {
+          "type": "string",
+          "enum": [
+            "NO_FINDINGS",
+            "FINDINGS_PRESENT"
+          ]
+        },
         "findings": {
           "type": "array",
           "items": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["id", "severity", "category", "where", "what_can_go_wrong", "concrete_fix"],
+            "required": [
+              "id",
+              "severity",
+              "category",
+              "where",
+              "what_can_go_wrong",
+              "concrete_fix"
+            ],
             "properties": {
-              "id": {"type": "string"},
-              "severity": {"type": "string", "enum": ["high", "medium", "low"]},
-              "category": {"type": "string"},
-              "where": {"type": "string"},
-              "what_can_go_wrong": {"type": "string"},
-              "concrete_fix": {"type": "string"}
+              "id": {
+                "type": "string"
+              },
+              "severity": {
+                "type": "string",
+                "enum": [
+                  "high",
+                  "medium",
+                  "low"
+                ]
+              },
+              "category": {
+                "type": "string"
+              },
+              "where": {
+                "type": "string"
+              },
+              "what_can_go_wrong": {
+                "type": "string"
+              },
+              "concrete_fix": {
+                "type": "string"
+              }
             }
           }
         },
@@ -109,10 +242,18 @@
           "items": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["id", "text"],
+            "required": [
+              "id",
+              "text"
+            ],
             "properties": {
-              "id": {"type": "string", "pattern": "^oq_r[0-9]+_[0-9]+$"},
-              "text": {"type": "string"}
+              "id": {
+                "type": "string",
+                "pattern": "^oq_r[0-9]+_[0-9]+$"
+              },
+              "text": {
+                "type": "string"
+              }
             }
           }
         }
@@ -123,12 +264,34 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["item_id", "decision", "rationale"],
+        "required": [
+          "item_id",
+          "decision",
+          "rationale"
+        ],
         "properties": {
-          "item_id": {"type": "string"},
-          "decision": {"type": "string", "enum": ["accept", "reject", "uncertain", "accept_via_user", "reject_via_user"]},
-          "rationale": {"type": "string"},
-          "stated_edit": {"type": ["string", "null"]}
+          "item_id": {
+            "type": "string"
+          },
+          "decision": {
+            "type": "string",
+            "enum": [
+              "accept",
+              "reject",
+              "uncertain",
+              "accept_via_user",
+              "reject_via_user"
+            ]
+          },
+          "rationale": {
+            "type": "string"
+          },
+          "stated_edit": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
         }
       }
     },
@@ -137,10 +300,17 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["section", "summary"],
+        "required": [
+          "section",
+          "summary"
+        ],
         "properties": {
-          "section": {"type": "string"},
-          "summary": {"type": "string"}
+          "section": {
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          }
         }
       }
     },
@@ -158,41 +328,142 @@
         "severity_histogram"
       ],
       "properties": {
-        "tokens_input": {"type": "integer", "minimum": 0},
-        "tokens_output": {"type": "integer", "minimum": 0},
-        "cost_usd": {"type": "number", "minimum": 0},
-        "cumulative_cost_usd": {"type": "number", "minimum": 0},
-        "duration_seconds": {"type": "number", "minimum": 0},
-        "plan_size_chars": {"type": "integer", "minimum": 0},
-        "plan_size_delta": {"type": "integer"},
+        "tokens_input": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "tokens_output": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cost_usd": {
+          "type": "number",
+          "minimum": 0
+        },
+        "cumulative_cost_usd": {
+          "type": "number",
+          "minimum": 0
+        },
+        "duration_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "plan_size_chars": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "plan_size_delta": {
+          "type": "integer"
+        },
         "severity_histogram": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["high", "medium", "low"],
+          "required": [
+            "high",
+            "medium",
+            "low"
+          ],
           "properties": {
-            "high": {"type": "integer", "minimum": 0},
-            "medium": {"type": "integer", "minimum": 0},
-            "low": {"type": "integer", "minimum": 0}
+            "high": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "medium": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "low": {
+              "type": "integer",
+              "minimum": 0
+            }
           }
         }
       }
+    },
+    "reviewer_independence": {
+      "type": "string",
+      "enum": [
+        "same-vendor",
+        "cross-vendor"
+      ],
+      "description": "Whether this round's reviewer shared a vendor with the planner. Optional: absent on sidecars written before it existed, where it is derived from `transport` on read."
+    },
+    "reviewer_attempts": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "description": "Per-attempt breakdown; null on sidecars written before it existed.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "transport",
+          "outcome"
+        ],
+        "properties": {
+          "transport": {
+            "type": "string"
+          },
+          "outcome": {
+            "type": "string"
+          },
+          "cost_usd": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "tokens_input": {
+            "type": "integer"
+          },
+          "tokens_output": {
+            "type": "integer"
+          }
+        }
+      }
+    },
+    "cost_accounting_complete": {
+      "type": "boolean",
+      "description": "False when an attempt could not be priced, making stats.cost_usd a lower bound."
     }
   },
   "allOf": [
     {
-      "comment": "Round 1 sidecar carries the baseline_plan_content + sha. Round >= 2 sidecars set both fields to null. (§5.7.3b round-9 finding 1.)",
-      "if": {"properties": {"round": {"const": 1}}, "required": ["round"]},
+      "comment": "Round 1 sidecar carries the baseline_plan_content + sha. Round >= 2 sidecars set both fields to null. (\u00a75.7.3b round-9 finding 1.)",
+      "if": {
+        "properties": {
+          "round": {
+            "const": 1
+          }
+        },
+        "required": [
+          "round"
+        ]
+      },
       "then": {
         "properties": {
-          "baseline_plan_content": {"type": "string"},
-          "baseline_plan_content_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+          "baseline_plan_content": {
+            "type": "string"
+          },
+          "baseline_plan_content_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
         },
-        "required": ["baseline_plan_content", "baseline_plan_content_sha256"]
+        "required": [
+          "baseline_plan_content",
+          "baseline_plan_content_sha256"
+        ]
       },
       "else": {
         "properties": {
-          "baseline_plan_content": {"type": "null"},
-          "baseline_plan_content_sha256": {"type": "null"}
+          "baseline_plan_content": {
+            "type": "null"
+          },
+          "baseline_plan_content_sha256": {
+            "type": "null"
+          }
         }
       }
     }
