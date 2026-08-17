@@ -699,6 +699,14 @@ class ExitDecision:
     # (`high`/`medium`/`low`/`open_question`) so a pair converts to a
     # `Deferral` directly.
     unvalidated_accepts: list[tuple[str, str]] = field(default_factory=list)
+    # True when an attempt could not be priced, so this round's cost is a known
+    # LOWER BOUND. It forces `needs_soft_block`, but the flow also has to be
+    # able to SAY so: an incomplete-accounting NO_FINDINGS round has no open
+    # items and no unvalidated accepts, so without this the soft-block fires
+    # with nothing to enumerate, produces an empty deferral list, and
+    # `escalate_to_resolved_with_deferrals` returns the decision unchanged —
+    # blocked, but with no actionable or auditable path out.
+    accounting_incomplete: bool = False
 
 
 def evaluate_exit(
@@ -737,6 +745,7 @@ def evaluate_exit(
     if state.reviewer_response.status == "NO_FINDINGS":
         return ExitDecision(
             reason=ExitReason.APPROVED,
+            accounting_incomplete=accounting_incomplete,
             open_highs=[],
             open_mediums=[],
             open_questions=[],
@@ -750,6 +759,7 @@ def evaluate_exit(
     if state.decisions and _all_rejected(state.decisions):
         return ExitDecision(
             reason=ExitReason.PLANNER_LOCKED,
+            accounting_incomplete=accounting_incomplete,
             open_highs=open_highs,
             open_mediums=open_mediums,
             open_questions=open_questions,
@@ -772,6 +782,7 @@ def evaluate_exit(
         if not has_accepts:
             return ExitDecision(
                 reason=ExitReason.RESOLVED,
+                accounting_incomplete=accounting_incomplete,
                 open_highs=[],
                 open_mediums=[],
                 open_questions=[],
@@ -790,6 +801,7 @@ def evaluate_exit(
     if cumulative_cost_usd >= cost_cap_usd:
         return ExitDecision(
             reason=ExitReason.COST_CAPPED,
+            accounting_incomplete=accounting_incomplete,
             open_highs=open_highs,
             open_mediums=open_mediums,
             open_questions=open_questions,
@@ -801,6 +813,7 @@ def evaluate_exit(
     if state.round_n >= max_rounds:
         return ExitDecision(
             reason=ExitReason.CEILING_HIT,
+            accounting_incomplete=accounting_incomplete,
             open_highs=open_highs,
             open_mediums=open_mediums,
             open_questions=open_questions,
@@ -813,6 +826,7 @@ def evaluate_exit(
     #    anything actually exit?" from open_* lists.
     return ExitDecision(
         reason=ExitReason.NO_EXIT,
+        accounting_incomplete=accounting_incomplete,
         open_highs=open_highs,
         open_mediums=open_mediums,
         open_questions=open_questions,
@@ -821,6 +835,25 @@ def evaluate_exit(
         # branch. It needs no handling on this path: the loop continues, and
         # round N+1's reviewer is the validation these items are waiting for.
         unvalidated_accepts=unvalidated_accepts,
+    )
+
+
+ACCOUNTING_DEFERRAL_ITEM_ID = "cost_accounting"
+
+
+def accounting_deferral(reason: str = "round cost is a lower bound — an attempt could not be priced") -> Deferral:
+    """The item an incomplete-accounting exit records.
+
+    Severity `high` on purpose: orchestrated mode stops its pipeline on an open
+    high, which is the fail-closed behaviour an unknown spend deserves. Without
+    a synthetic item there is literally nothing to enumerate, so the soft-block
+    would block without producing an audit record.
+    """
+    return Deferral(
+        item_id=ACCOUNTING_DEFERRAL_ITEM_ID,
+        severity="high",
+        reason=reason,
+        target_version="accepted-at-exit",
     )
 
 
@@ -856,6 +889,7 @@ def escalate_to_resolved_with_deferrals(
         open_questions=decision.open_questions,
         needs_soft_block=False,
         unvalidated_accepts=decision.unvalidated_accepts,
+        accounting_incomplete=decision.accounting_incomplete,
     )
 
 

@@ -219,6 +219,10 @@ sys.path.insert(0, '<skill-dir>/scripts')
 from reviewer import detect_transport
 from run_review_round import run_review_round
 
+# The ONE running total. Assigned here, consumed by the JSON below, by
+# RoundState in step 6, and by evaluate_exit in step 7 — and carried into the
+# next round as CUMULATIVE_COST. Nothing else computes it; a second expression
+# for the same number is how the sidecar and the cost gate end up disagreeing.
 outcome = run_review_round(
     repo_root=Path.cwd(),          # must equal cwd; the runner enforces it
     slug='<slug>',
@@ -228,6 +232,8 @@ outcome = run_review_round(
     consistency_only=CONSISTENCY_ONLY,
     cumulative_cost_usd=CUMULATIVE_COST,
 )
+
+new_cumulative_cost = round(CUMULATIVE_COST + outcome.total_cost_usd, 4)
 
 print(json.dumps({
   'status': outcome.result.status,
@@ -241,9 +247,7 @@ print(json.dumps({
   # The round's running total, not the round's own cost. Nothing else computes
   # this: pass the result back as CUMULATIVE_COST next round and persist it in
   # step 6, or round 2 records round 1's figure.
-  # new_cumulative_cost — carry this into steps 6 and 7, and into the next
-  # round as CUMULATIVE_COST. Nothing else computes it.
-  'cumulative_cost_usd': round(CUMULATIVE_COST + outcome.total_cost_usd, 4),
+  'cumulative_cost_usd': new_cumulative_cost,
   'cost_accounting_complete': outcome.cost_complete,
   'attempts': [a.__dict__ for a in outcome.attempts],
   'raw_response_text': outcome.result.raw_response_text,
@@ -478,9 +482,11 @@ Possible outcomes (in priority order — `evaluate_exit` evaluates them in this 
 
 Note: the `resolved_with_deferrals` reason is NOT returned directly by `evaluate_exit`; it is produced by calling `escalate_to_resolved_with_deferrals(decision, deferrals)` after the user completes the soft-block deferral flow described below.
 
-**Two kinds of item can force a soft-block, and both must be handled.** `decision.open_highs` / `open_mediums` / `open_questions` are items the planner never decided. `decision.unvalidated_accepts` is a list of `(item_id, severity)` pairs the planner *accepted* this round — decided, so absent from the `open_*` lists, but the plan edits they produced have not been read by any reviewer. A `cost_capped` or `ceiling_hit` exit on those ends the loop on an unvalidated plan, which is what the `resolved` gate's accept guard exists to prevent, so treat them as first-class items everywhere below. Their severities already use the deferral vocabulary (`high`/`medium`/`low`/`open_question`), so each pair converts to a `Deferral` directly.
+**Three things can force a soft-block, and all three must be handled.** `decision.open_highs` / `open_mediums` / `open_questions` are items the planner never decided. `decision.unvalidated_accepts` is a list of `(item_id, severity)` pairs the planner *accepted* this round — decided, so absent from the `open_*` lists, but the plan edits they produced have not been read by any reviewer. A `cost_capped` or `ceiling_hit` exit on those ends the loop on an unvalidated plan, which is what the `resolved` gate's accept guard exists to prevent, so treat them as first-class items everywhere below. Their severities already use the deferral vocabulary (`high`/`medium`/`low`/`open_question`), so each pair converts to a `Deferral` directly.
 
-If `decision.needs_soft_block` is True, run the §5.4.1 soft-block flow — **unless in orchestrated mode** (invoked by `/ship`), in which case do not ask: any open HIGH finding **or any `unvalidated_accepts` entry with severity `high`** → exit with the underlying reason (`ceiling_hit` / `cost_capped` / `planner_locked`) and report both lists to the orchestrator (it stops its pipeline) — an accepted high whose edit nobody reviewed is no safer to ship than an undecided one; otherwise auto-populate `Deferral(item_id, severity, reason="auto-deferred by /ship at exit", target_version="backlog")` for every open medium/low item **and `Deferral(item_id, severity, reason="validation skipped by /ship at exit — edit never reviewed", target_version="backlog")` for every remaining `unvalidated_accepts` entry** (the distinct reason is what lets an audit tell a deferred finding from an unreviewed edit), stash them on `state.deferrals_at_exit`, re-run step 6 persistence, and promote via `escalate_to_resolved_with_deferrals(decision, deferrals)`. Interactive invocations proceed with the flow below:
+Third, `decision.accounting_incomplete` is True when an attempt could not be priced, making this round's cost a known **lower bound** — the cap may already have been passed without firing. This one has no natural item to enumerate: an incomplete-accounting `NO_FINDINGS` round has no open items and no unvalidated accepts, so without a synthetic entry the soft-block would fire with nothing to show, produce an empty deferral list, and `escalate_to_resolved_with_deferrals` would hand back the original decision unchanged — blocked, but with no audit record and no way out. So whenever it is set, add `loop_state.accounting_deferral()` to the deferral list in **every** branch below. It carries severity `high` deliberately, which makes orchestrated mode stop: an unknown spend should fail closed.
+
+If `decision.needs_soft_block` is True, run the §5.4.1 soft-block flow — **unless in orchestrated mode** (invoked by `/ship`), in which case do not ask: any open HIGH finding, **any `unvalidated_accepts` entry with severity `high`, or `decision.accounting_incomplete`** → exit with the underlying reason (`ceiling_hit` / `cost_capped` / `planner_locked`) and report both lists to the orchestrator (it stops its pipeline) — an accepted high whose edit nobody reviewed is no safer to ship than an undecided one; otherwise auto-populate `Deferral(item_id, severity, reason="auto-deferred by /ship at exit", target_version="backlog")` for every open medium/low item **and `Deferral(item_id, severity, reason="validation skipped by /ship at exit — edit never reviewed", target_version="backlog")` for every remaining `unvalidated_accepts` entry** (the distinct reason is what lets an audit tell a deferred finding from an unreviewed edit), stash them on `state.deferrals_at_exit`, re-run step 6 persistence, and promote via `escalate_to_resolved_with_deferrals(decision, deferrals)`. Interactive invocations proceed with the flow below:
 
 1. **Step 1 (action selection):** `AskUserQuestion` with three options — "Defer all (collect reasons + targets in next step)", "Continue looping despite the exit condition", "Exit anyway, accept all risk".
 2. **Step 2 (per-item collection, only on Defer):** for each open finding/open-question **and each `unvalidated_accepts` entry**, `AskUserQuestion` with free-text "Other" for the deferral reason. Ask about the two kinds separately and say which is which — an open item asks "should this finding be addressed later?", an unvalidated accept asks "you already edited the plan for this; is shipping that edit unreviewed acceptable?" For mediums, also collect a target version (e.g. "v2.1", "Phase X", "backlog", or free-text). Build a list of `Deferral` objects and stash them on `state.deferrals_at_exit` BEFORE re-running step 6 — the sidecar must persist the deferrals or the exit can't be audited.

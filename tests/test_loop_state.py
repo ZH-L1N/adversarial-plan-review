@@ -21,6 +21,7 @@ from loop_state import (
     StartOverPlan,
     _all_rejected,
     _open_items,
+    accounting_deferral,
     build_sidecar,
     cleanup_snapshots,
     compute_round_diff,
@@ -1089,3 +1090,41 @@ def test_incomplete_accounting_blocks_every_clean_exit(build, expected_reason):
     decision = evaluate_exit(state, cumulative_cost_usd=0.5, cost_cap_usd=5.0)
     assert decision.reason == expected_reason
     assert decision.needs_soft_block is True
+
+
+def test_incomplete_accounting_has_an_auditable_way_out():
+    """Blocking is not enough — the flow must be able to record WHY.
+
+    A NO_FINDINGS round with an unpriceable attempt has no open items and no
+    unvalidated accepts, so before `accounting_deferral()` existed the
+    soft-block fired with nothing to enumerate: the deferral list came out
+    empty and `escalate_to_resolved_with_deferrals` returned the original
+    decision unchanged. Blocked, unauditable, and with no way to proceed.
+    """
+    state = _state(review=_review(status="NO_FINDINGS"))
+    state.cost_accounting_complete = False
+
+    decision = evaluate_exit(state, cumulative_cost_usd=0.5, cost_cap_usd=5.0)
+    assert decision.reason == ExitReason.APPROVED
+    assert decision.needs_soft_block is True
+    assert decision.accounting_incomplete is True
+    # Nothing else in the decision can be enumerated — that is the whole point.
+    assert not decision.open_highs and not decision.open_mediums
+    assert not decision.open_questions and not decision.unvalidated_accepts
+
+    deferral = accounting_deferral()
+    assert deferral.severity == "high"  # orchestrated mode stops on an open high
+    escalated = escalate_to_resolved_with_deferrals(decision, [deferral])
+    assert escalated.reason == ExitReason.RESOLVED_WITH_DEFERRALS
+    assert escalated.accounting_incomplete is True
+
+
+def test_accounting_deferral_is_schema_valid_in_a_sidecar():
+    """The synthetic item must survive persistence like any other deferral."""
+    state = _state(review=_review(status="NO_FINDINGS"), baseline="# plan")
+    state.cost_accounting_complete = False
+    state.deferrals_at_exit = [accounting_deferral()]
+    sidecar = build_sidecar(state, raw_response_text="{}")
+    validate_sidecar(sidecar)
+    assert sidecar["cost_accounting_complete"] is False
+    assert sidecar["deferrals_at_exit"][0]["item_id"] == "cost_accounting"
