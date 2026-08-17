@@ -38,7 +38,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from parse_review import Finding, OpenQuestion, ReviewResult
+from parse_review import Finding, OpenQuestion, ReviewResult, ReviewUsage
 import render_markdown
 
 
@@ -135,6 +135,14 @@ class RoundState:
     restart_metadata: dict[str, Any] | None = None
     plan_content_at_end: str = ""
     baseline_plan_content: str | None = None
+    # Usage for the WHOLE round, including attempts that failed after spending
+    # money (a guard-truncated run, a malformed success that was billed before
+    # it failed to parse). `reviewer_response.usage` is the winning call only,
+    # so persisting that alone can under-report a retried round by close to
+    # half — and `cumulative_cost_usd`, the resume total, and the cost cap all
+    # read what lands in the sidecar. Set from `RoundRunOutcome`; when None the
+    # winning call is the whole round and its usage is used verbatim.
+    round_usage: ReviewUsage | None = None
     cumulative_cost_usd: float = 0.0
     duration_seconds: float = 0.0
     plan_size_delta: int = 0
@@ -348,6 +356,9 @@ def build_sidecar(state: RoundState, *, raw_response_text: str) -> dict[str, Any
     # state is not buildable at all.
     _validate_decision_ids(state)
 
+    # The verdict stays the winning ReviewResult; only the accounting widens.
+    round_usage = state.round_usage or state.reviewer_response.usage
+
     plan_bytes = state.plan_content_at_end.encode("utf-8")
     plan_sha = hashlib.sha256(plan_bytes).hexdigest()
 
@@ -407,9 +418,10 @@ def build_sidecar(state: RoundState, *, raw_response_text: str) -> dict[str, Any
         "planner_decisions": [d.to_dict() for d in state.decisions],
         "plan_edits_applied": [e.to_dict() for e in state.plan_edits],
         "stats": {
-            "tokens_input": state.reviewer_response.usage.tokens_input,
-            "tokens_output": state.reviewer_response.usage.tokens_output,
-            "cost_usd": state.reviewer_response.usage.cost_usd,
+            # Round totals, not the winning call's — see RoundState.round_usage.
+            "tokens_input": round_usage.tokens_input,
+            "tokens_output": round_usage.tokens_output,
+            "cost_usd": round_usage.cost_usd,
             "cumulative_cost_usd": state.cumulative_cost_usd,
             "duration_seconds": state.duration_seconds,
             "plan_size_chars": len(state.plan_content_at_end),

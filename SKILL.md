@@ -202,144 +202,87 @@ The header is rendered by `scripts/render_markdown.py` from the round-1 sidecar 
 
 ### Round N
 
-**1. Build the reviewer prompt.**
+**1-2. Build and invoke, in one call.**
 
-Locate this skill's directory (the folder containing this SKILL.md). Use the diff-aware v2 builder (`build_reviewer_prompt_v2.py`); the v1 builder is kept only for fallback debugging.
-
-Pass the **active transport** (the name Setup step 2 reported) via `--transport`: it selects the reviewer calibration. Omitting it silently builds the openai prompt, which on a claude round means no repo-verification and no finding caps.
-
-For round 1:
-
-```bash
-python "<skill-dir>/scripts/build_reviewer_prompt_v2.py" \
-  --plan-file "plans/<version>-<slug>.md" \
-  --slug "<slug>" \
-  --version "<version>" \
-  --round 1 \
-  --transport "$TRANSPORT" \
-  > /tmp/round-1-prompt.txt
-```
-
-For round N > 1, first compute the diff via `loop_state.compute_round_diff()`, then pass it to the builder:
+`scripts/run_review_round.py` owns the round: it computes the diff, builds the
+prompt, invokes the reviewer, applies the retry policy, and on OpenAI quota
+exhaustion rebuilds for the Claude calibration and re-invokes. It used to live
+here as embedded Python, which is how a fallback argv carrying a *comment*
+where `--diff-file` should be stayed broken from round 2 onward through every
+green suite — nothing can import a Markdown code block.
 
 ```bash
 python -c "
-import sys
-sys.path.insert(0, '<skill-dir>/scripts')
-from pathlib import Path
-from loop_state import compute_round_diff
-diff_text, recovered = compute_round_diff(
-    Path('plans/<version>-<slug>.md'),
-    round_n=N, slug='<slug>', version='<version>',
-)
-Path('/tmp/round-N-diff.patch').write_text(diff_text, encoding='utf-8')
-print('recovered_from_git=', recovered)  # True only if .scratch/ wiped + sidecars unrecoverable
-"
-
-python "<skill-dir>/scripts/build_reviewer_prompt_v2.py" \
-  --plan-file "plans/<version>-<slug>.md" \
-  --slug "<slug>" \
-  --version "<version>" \
-  --round N \
-  --diff-file /tmp/round-N-diff.patch \
-  $(test "$RECOVERED" = "True" && echo "--diff-recovered-from-git") \
-  $(test "$CONSISTENCY_ONLY" = "True" && echo "--consistency-only") \
-  --cumulative-cost-usd "$CUMULATIVE_COST" \
-  --transport "$TRANSPORT" \
-  > /tmp/round-N-prompt.txt
-```
-
-The builder emits a richer prompt with prior-rounds summary, accepted findings to verify, rejected findings for context, the unified diff, and the full plan for cross-reference. See plans/v2-plan.md §5.3.
-
-**2. Invoke the reviewer (foreground, read-only).**
-
-The transport (`openai`, `claude` or `codex`) is auto-detected at skill start (Setup step 2). Use `scripts/reviewer.py` regardless of which transport — it abstracts the difference:
-
-```bash
-# in a small inline Python snippet you run via Bash, after building the prompt above
-python -c "
-import os, sys, json, re, subprocess
+import sys, json
 from pathlib import Path
 sys.path.insert(0, '<skill-dir>/scripts')
-from reviewer import (
-    QuotaExhaustedError, TransportSelection, _is_claude_cli_available,
-    detect_transport, invoke_reviewer,
+from reviewer import detect_transport
+from run_review_round import run_review_round
+
+outcome = run_review_round(
+    repo_root=Path.cwd(),          # must equal cwd; the runner enforces it
+    slug='<slug>',
+    version='<version>',
+    round_n=N,
+    selection=detect_transport(),
+    consistency_only=CONSISTENCY_ONLY,
+    cumulative_cost_usd=CUMULATIVE_COST,
 )
-
-SLUG, VERSION, ROUND_N = '<slug>', '<version>', N
-SKILL_DIR = '<skill-dir>'
-fixes_path = Path(f'plans/fixs/{VERSION}-{SLUG}-fixes.md')
-
-prompt_path = Path('/tmp/round-N-prompt.txt')
-selection = detect_transport()
-explicit = (os.environ.get('ADVERSARIAL_TRANSPORT') or '').strip().lower()
-
-try:
-    result = invoke_reviewer(prompt_path.read_text(encoding='utf-8'), round_n=ROUND_N,
-                             transport=selection, repo_root=os.getcwd())
-except QuotaExhaustedError:
-    # Quota fallback: auto-detected openai only. An EXPLICIT selection surfaces.
-    if explicit or not _is_claude_cli_available(dict(os.environ)):
-        raise
-    print('transport fallback: openai quota exhausted -> claude', file=sys.stderr)
-    # Rebuild the prompt for the CLAUDE calibration — the one we just used has
-    # no <repo_verification>/<finding_discipline>/<output_format> blocks.
-    subprocess.run([sys.executable, f'{SKILL_DIR}/scripts/build_reviewer_prompt_v2.py',
-                    '--plan-file', f'plans/{VERSION}-{SLUG}.md', '--slug', SLUG,
-                    '--version', VERSION, '--round', str(ROUND_N),
-                    '--transport', 'claude',
-                    # plus the same --diff-file/--consistency-only/--cumulative-cost-usd
-                    # arguments step 1 used for this round, when ROUND_N > 1
-                    ], stdout=prompt_path.open('w', encoding='utf-8'), check=True)
-    result = invoke_reviewer(prompt_path.read_text(encoding='utf-8'), round_n=ROUND_N,
-                             transport=TransportSelection('claude', 'openai quota exhausted'),
-                             repo_root=os.getcwd())
-
-# Compute cumulative cost from prior round-stats blocks in the fixes-md.
-# (Phase 4 will replace this with sidecar-based recovery.)
-prior_cumulative = 0.0
-if fixes_path.exists():
-    text = fixes_path.read_text(encoding='utf-8')
-    matches = re.findall(r'cumulative:\s*\\\$([0-9.]+)', text)
-    if matches:
-        prior_cumulative = float(matches[-1])
-cumulative_cost_usd = prior_cumulative + result.usage.cost_usd
 
 print(json.dumps({
-  'status': result.status,
-  'findings': [f.to_dict() for f in result.findings],
-  'open_questions': [oq.to_dict() for oq in result.open_questions],
-  'transport': result.transport,
-  'model': result.model,
-  'tokens_input': result.usage.tokens_input,
-  'tokens_output': result.usage.tokens_output,
-  'cost_usd': result.usage.cost_usd,
-  'cumulative_cost_usd': round(cumulative_cost_usd, 4),
-  'raw_response_text': result.raw_response_text,
+  'status': outcome.result.status,
+  'findings': [f.to_dict() for f in outcome.result.findings],
+  'open_questions': [oq.to_dict() for oq in outcome.result.open_questions],
+  'transport': outcome.transport,
+  'model': outcome.result.model,
+  'tokens_input': outcome.tokens_input,
+  'tokens_output': outcome.tokens_output,
+  'cost_usd': outcome.total_cost_usd,
+  'attempts': [a.__dict__ for a in outcome.attempts],
+  'raw_response_text': outcome.result.raw_response_text,
 }))
 "
 ```
 
-The reviewer module:
-- Picks transport via env (`ADVERSARIAL_TRANSPORT`, then `OPENAI_API_KEY`, then Claude CLI, then Codex availability)
-- For OpenAI: uses Responses API with strict JSON schema (`gpt-5.6-sol` default), guaranteeing severity-tagged findings
-- For Claude: runs `claude -p --output-format json` with the containment flags above, prompt over stdin, `cwd=repo_root` so the repo-verification pass can read the plan's repo; checks `is_error`/`subtype` **before** touching `result` (null on errors), records `total_cost_usd` verbatim, and sums the cache token fields into `tokens_input`
-- For Codex: pipes prompt via stdin (Windows-safe; bypasses argv length limits), then runs the keyword-based severity heuristic
-- Returns a normalized `ReviewResult` with `status`, `findings`, `open_questions`, transport metadata, and usage figures. **The sidecar records the transport/model that actually ran** — after a quota fallback that is `claude` + the resolved model id, not the openai selection you started with
+Keep this call to named arguments only. A signature change then shows up as a
+visible mismatch rather than a silently wrong argv — which is the failure mode
+this extraction exists to remove.
 
-Retry policy is keyed on `TransportError.kind`, not on a bare boolean — a 1200-second wall-clock timeout and a rate limit were both "transient" under the old flag, but retrying the first costs `2 × ADVERSARIAL_CLAUDE_TIMEOUT_S` before failing anyway:
+**Record `outcome.total_cost_usd`, not `outcome.result.usage.cost_usd`.** A
+failed attempt can still have cost money: a `max_turns` / `max_budget` envelope
+reports what it spent before the guard tripped, and a malformed success
+consumed tokens before it failed to parse. Both are retried, and counting only
+the winning call can under-report a round by close to half — which is the
+number the cost cap gates on. `outcome.attempts` carries the per-try breakdown
+for the sidecar.
 
-| `kind` | Policy |
+The transport recorded must be `outcome.transport`: after a quota fallback that
+is `claude` and the resolved Claude model, not the openai selection the round
+started with.
+
+Retry policy is keyed on `TransportError.kind`, plus `ReviewSchemaError`:
+
+| Failure | Policy |
 |---|---|
-| `max_turns`, `max_budget` | One retry (D20). Truncation by our own guard is not a failure; two in a row is an operator problem — raise the cap. |
-| `api` | One retry. Rate limit, overload, network blip, or a success envelope with no `result` text. |
-| `wall_timeout` | **Never retried.** The retry inherits the same timeout. |
-| `permanent` | Never retried. Auth failure, bad request, unknown model. |
-| `quota` (`QuotaExhaustedError`) | Never retried — it is the transport switch above. |
+| `max_turns`, `max_budget`, `api` | One retry. Truncation by our own guard is not a failure; two in a row is an operator problem — raise the cap. |
+| `ReviewSchemaError` | One retry. That response was already paid for. |
+| `wall_timeout` | Never. The retry inherits the same timeout. |
+| `permanent` | Never. Auth failure, bad request, unknown model. |
+| `quota` | Never — it is the transport switch, and only for an auto-detected openai selection with the Claude CLI available. An explicit `ADVERSARIAL_TRANSPORT=openai` surfaces the error instead. |
 
-`is_transient` remains as a read-only derived view of `kind` for callers that only need a yes/no; it cannot be set independently.
+Ceiling: at most two attempts per transport and one fallback switch, so four
+calls worst case, enforced by a counter rather than recursion.
 
-> **Not yet wired into this loop.** The classification above is enforced and tested in `reviewer.py`, but step 2 here still catches only `QuotaExhaustedError`, so a retryable kind currently ends the round instead of getting its one retry. The wrapper belongs in the round runner that `scripts/run_review_round.py` will own — adding it to this markdown-embedded block would extend exactly the untestable-orchestration surface that extraction exists to remove.
+**Debugging.** Pass `keep_prompt=True` and read `outcome.prompt_debug_path`.
+The path is unique per run — a fixed `/tmp/round-N-prompt.txt` was cross-run
+shared state, so two concurrent reviews at the same round number could
+overwrite each other\'s prompt between build and invoke.
+
+To inspect the builder directly, it keeps its CLI:
+
+```bash
+python "<skill-dir>/scripts/build_reviewer_prompt_v2.py" --help
+```
 
 **3. Interpret the result.**
 
@@ -383,6 +326,7 @@ import sys, time
 sys.path.insert(0, '<skill-dir>/scripts')
 from datetime import datetime, timezone
 from pathlib import Path
+from parse_review import ReviewUsage
 from loop_state import (
     RoundState, PlannerDecision, PlanEdit,
     build_sidecar, write_sidecar_atomic, regenerate_fixes_md,
@@ -395,7 +339,12 @@ state = RoundState(
     round_n=N, slug='<slug>', version='<version>',
     transport=result_transport, model=result_model,
     started_at=ROUND_START_ISO, completed_at=datetime.now(tz=timezone.utc).isoformat(),
-    reviewer_response=parsed_review_result,   # ReviewResult from step 2
+    reviewer_response=parsed_review_result,   # the WINNING ReviewResult (the verdict)
+    # Round totals from RoundRunOutcome, not the winning call's usage: a
+    # retried round paid for the failed attempts too, and stats.cost_usd is
+    # what cumulative cost, the resume total and the cost cap all read.
+    round_usage=ReviewUsage(outcome.tokens_input, outcome.tokens_output,
+                            outcome.total_cost_usd),
     decisions=[PlannerDecision(...) for ...], # one per finding/open-question
     plan_edits=[PlanEdit(...) for ...],       # one per applied edit
     plan_content_at_end=Path('plans/<version>-<slug>.md').read_text(encoding='utf-8'),

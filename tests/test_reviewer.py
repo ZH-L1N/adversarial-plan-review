@@ -920,3 +920,35 @@ def test_transport_selection_is_frozen():
     sel = TransportSelection(name="openai", reason="test")
     with pytest.raises(Exception):  # FrozenInstanceError or AttributeError
         sel.name = "codex"
+
+
+def test_error_envelope_cost_prefers_the_reported_total():
+    env = {"is_error": True, "subtype": "error_max_turns",
+           "total_cost_usd": 0.42, "usage": {"input_tokens": 10, "output_tokens": 5}}
+    with pytest.raises(TransportError) as exc:
+        reviewer._raise_on_claude_error_envelope(
+            env, max_turns=120, max_budget="5.0", chosen_model="opus"
+        )
+    assert exc.value.cost_usd == pytest.approx(0.42)
+
+
+def test_error_envelope_cost_estimates_when_total_absent():
+    """No reported total, but real tokens — estimate at the resolved rate."""
+    env = {"is_error": True, "subtype": "error_max_turns",
+           "usage": {"input_tokens": 1_000_000, "output_tokens": 0}}
+    with pytest.raises(TransportError) as exc:
+        reviewer._raise_on_claude_error_envelope(
+            env, max_turns=120, max_budget="5.0", chosen_model="opus"
+        )
+    # opus -> claude-opus-5 -> $5/1M input
+    assert exc.value.cost_usd == pytest.approx(5.0)
+
+
+def test_error_envelope_cost_is_unknown_not_zero_when_unpriceable():
+    """No total and no tokens: None, so the caller can flag incomplete accounting."""
+    env = {"is_error": True, "subtype": "error_max_turns"}
+    with pytest.raises(TransportError) as exc:
+        reviewer._raise_on_claude_error_envelope(
+            env, max_turns=120, max_budget="5.0", chosen_model="opus"
+        )
+    assert exc.value.cost_usd is None

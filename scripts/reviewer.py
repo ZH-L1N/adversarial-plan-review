@@ -167,7 +167,15 @@ class TransportError(RuntimeError):
     spends 40 minutes on one round before failing anyway.
     """
 
-    def __init__(self, message: str, *, kind: str = "permanent") -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        kind: str = "permanent",
+        cost_usd: float | None = None,
+        tokens_input: int = 0,
+        tokens_output: int = 0,
+    ) -> None:
         super().__init__(message)
         if kind not in TRANSPORT_ERROR_KINDS:
             raise ValueError(
@@ -175,6 +183,20 @@ class TransportError(RuntimeError):
                 f"{TRANSPORT_ERROR_KINDS}"
             )
         self.kind = kind
+        # A failed attempt can still have cost money — a `max_turns` /
+        # `max_budget` envelope reports `total_cost_usd` for the work done
+        # before the guard tripped. The caller retries, and counting only the
+        # winning call would under-report the round, which is what the cost cap
+        # gates on.
+        #
+        # `None` means UNKNOWN, and is deliberately not 0.0: collapsing the two
+        # would let an unpriceable attempt silently lower the cap's denominator
+        # while looking like a free one. A caller can then surface incomplete
+        # accounting, or block conservatively, instead of trusting a total that
+        # quietly omits a call.
+        self.cost_usd = cost_usd
+        self.tokens_input = tokens_input
+        self.tokens_output = tokens_output
 
     @property
     def is_transient(self) -> bool:
@@ -199,7 +221,11 @@ class QuotaExhaustedError(TransportError):
     """
 
     def __init__(self, message: str) -> None:
-        super().__init__(message, kind="quota")
+        # cost 0.0, not None: this is raised from the account-out-of-quota
+        # markers, i.e. the request was REJECTED rather than served, so nothing
+        # was billed. Reporting it as unknown would flag every ordinary quota
+        # fallback as incomplete accounting and make that signal useless.
+        super().__init__(message, kind="quota", cost_usd=0.0)
 
 
 class TransportUnavailableError(TransportError):
@@ -220,7 +246,15 @@ class TransportUnavailableError(TransportError):
 @dataclass(frozen=True)
 class TransportSelection:
     name: str  # "openai" | "claude" | "codex"
-    reason: str  # Human-readable explanation, surfaced in logs
+    reason: str  # Human-readable explanation, surfaced in logs. DISPLAY ONLY.
+    # Structured provenance. Policy (notably the quota fallback, which may only
+    # switch away from an AUTO-DETECTED openai) reads this, never `reason` —
+    # inferring explicitness by string-matching a human-readable sentence meant
+    # a reworded message, or a legitimate hand-built selection, would silently
+    # change behaviour. Defaults to "explicit" so an unknown provenance fails
+    # closed: worst case the operator sees the error instead of being quietly
+    # moved to another reviewer.
+    source: str = "explicit"
 
 
 def detect_transport(*, env: dict[str, str] | None = None) -> TransportSelection:
@@ -239,22 +273,22 @@ def detect_transport(*, env: dict[str, str] | None = None) -> TransportSelection
     env = dict(os.environ if env is None else env)
     explicit = (env.get("ADVERSARIAL_TRANSPORT") or "").strip().lower()
     if explicit == "openai":
-        return TransportSelection("openai", "ADVERSARIAL_TRANSPORT=openai")
+        return TransportSelection("openai", "ADVERSARIAL_TRANSPORT=openai", source="explicit")
     if explicit == "codex":
-        return TransportSelection("codex", "ADVERSARIAL_TRANSPORT=codex")
+        return TransportSelection("codex", "ADVERSARIAL_TRANSPORT=codex", source="explicit")
     if explicit == "claude":
-        return TransportSelection("claude", "ADVERSARIAL_TRANSPORT=claude")
+        return TransportSelection("claude", "ADVERSARIAL_TRANSPORT=claude", source="explicit")
     if explicit:
         raise TransportError(
             f"ADVERSARIAL_TRANSPORT must be 'openai', 'codex' or 'claude', got '{explicit}'"
         )
 
     if env.get("OPENAI_API_KEY"):
-        return TransportSelection("openai", "OPENAI_API_KEY is set")
+        return TransportSelection("openai", "OPENAI_API_KEY is set", source="openai_key")
     if _is_claude_cli_available(env):
-        return TransportSelection("claude", "Claude CLI on PATH")
+        return TransportSelection("claude", "Claude CLI on PATH", source="claude_path")
     if _is_codex_cli_available(env):
-        return TransportSelection("codex", "Codex CLI on PATH")
+        return TransportSelection("codex", "Codex CLI on PATH", source="codex_path")
 
     raise TransportUnavailableError(
         "No reviewer transport configured. "
@@ -430,9 +464,14 @@ def _invoke_openai(prompt: str, *, round_n: int, model: str | None) -> ReviewRes
             usage_output_tokens=tokens_output,
             cost_usd=cost_usd,
         )
-    except ReviewSchemaError:
+    except ReviewSchemaError as exc:
         # Schema violations are surfaced to the caller for the retry-once policy
-        # (D20). Annotate so logs show which transport produced the bad output.
+        # (D20). The response was already billed before it failed to parse, so
+        # attach what it cost — same contract as the claude path. Without this
+        # an OpenAI malformed-success retry is accounted as free.
+        exc.cost_usd = cost_usd
+        exc.tokens_input = tokens_input
+        exc.tokens_output = tokens_output
         raise
 
 
@@ -629,7 +668,10 @@ def _invoke_claude(
         envelope = _envelope_or_none(exc.stdout)
         if envelope is not None:
             _raise_on_claude_error_envelope(
-                envelope, max_turns=max_turns, max_budget=max_budget
+                envelope,
+                max_turns=max_turns,
+                max_budget=max_budget,
+                chosen_model=chosen_model,
             )
         stderr_excerpt = (exc.stderr or "")[-2000:]
         raise TransportError(
@@ -644,15 +686,9 @@ def _invoke_claude(
     envelope = _parse_claude_envelope(result.stdout)
     # is_error / subtype are checked BEFORE `result` is touched: `result` is
     # null on every error envelope (R1-H4).
-    _raise_on_claude_error_envelope(envelope, max_turns=max_turns, max_budget=max_budget)
-
-    raw_text = envelope.get("result")
-    if not isinstance(raw_text, str) or not raw_text.strip():
-        raise TransportError(
-            "Claude CLI success envelope carried no `result` text; "
-            "cannot parse reviewer JSON",
-            kind="api",
-        )
+    _raise_on_claude_error_envelope(
+        envelope, max_turns=max_turns, max_budget=max_budget, chosen_model=chosen_model
+    )
 
     resolved_model = _resolve_claude_model_id(envelope, fallback=chosen_model)
     tokens_input, tokens_output = _extract_claude_usage(envelope)
@@ -663,14 +699,36 @@ def _invoke_claude(
         tokens_output=tokens_output,
     )
 
-    return parse_claude_response(
-        raw_text,
-        round_n=round_n,
-        model=resolved_model,
-        usage_input_tokens=tokens_input,
-        usage_output_tokens=tokens_output,
-        cost_usd=cost_usd,
-    )
+    raw_text = envelope.get("result")
+    if not isinstance(raw_text, str) or not raw_text.strip():
+        # Usage is extracted above so this carries what the empty round cost.
+        raise TransportError(
+            "Claude CLI success envelope carried no `result` text; "
+            "cannot parse reviewer JSON",
+            kind="api",
+            cost_usd=cost_usd,
+            tokens_input=tokens_input,
+            tokens_output=tokens_output,
+        )
+
+    try:
+        return parse_claude_response(
+            raw_text,
+            round_n=round_n,
+            model=resolved_model,
+            usage_input_tokens=tokens_input,
+            usage_output_tokens=tokens_output,
+            cost_usd=cost_usd,
+        )
+    except ReviewSchemaError as exc:
+        # This response was paid for before it failed to parse, and D20 grants
+        # it one retry — so the caller needs the spend attached or the round
+        # under-reports by a whole call. Same contract as TransportError's
+        # fields; the runner reads both with getattr.
+        exc.cost_usd = cost_usd
+        exc.tokens_input = tokens_input
+        exc.tokens_output = tokens_output
+        raise
 
 
 def _parse_claude_envelope(stdout: str) -> dict:
@@ -703,7 +761,7 @@ def _envelope_or_none(stdout: object) -> dict | None:
 
 
 def _raise_on_claude_error_envelope(
-    envelope: dict, *, max_turns: int, max_budget: str
+    envelope: dict, *, max_turns: int, max_budget: str, chosen_model: str
 ) -> None:
     """Raise a classified `TransportError` for any non-success envelope."""
     subtype = str(envelope.get("subtype") or "")
@@ -711,14 +769,25 @@ def _raise_on_claude_error_envelope(
     if not is_error and subtype in ("", "success"):
         return
 
+    # Usage BEFORE raising. A guard-truncated run did real work and the
+    # envelope reports what it cost; raising bare would hide that from the
+    # caller's per-round total, which is what the cost cap gates on. Only the
+    # envelope's own figures are used here — the rate-table estimate needs a
+    # resolved model id that an error envelope may not carry, and guessing is
+    # worse than reporting nothing.
+    spent, tok_in, tok_out = _reported_usage(envelope, chosen_model=chosen_model)
+
     # Truncation by OUR OWN guard: the run didn't fail, it ran out of the
-    # allowance we set. Transient so D20's retry-once applies (the retry
+    # allowance we set. Retryable so D20's retry-once applies (the retry
     # inherits the same caps, so two truncations surface to the operator).
     if subtype == "error_max_turns":
         raise TransportError(
             f"Claude review truncated by our own guard: --max-turns {max_turns} "
             "exhausted (raise ADVERSARIAL_CLAUDE_MAX_TURNS if this repeats).",
             kind="max_turns",
+            cost_usd=spent,
+            tokens_input=tok_in,
+            tokens_output=tok_out,
         )
     detail = str(envelope.get("terminal_reason") or "").strip()
     if "budget" in subtype or "budget" in detail.lower():
@@ -726,6 +795,9 @@ def _raise_on_claude_error_envelope(
             f"Claude review truncated by our own guard: --max-budget-usd {max_budget} "
             "exhausted (raise ADVERSARIAL_CLAUDE_MAX_BUDGET_USD if this repeats).",
             kind="max_budget",
+            cost_usd=spent,
+            tokens_input=tok_in,
+            tokens_output=tok_out,
         )
 
     lowered = f"{subtype} {detail}".lower()
@@ -733,7 +805,44 @@ def _raise_on_claude_error_envelope(
         f"Claude CLI returned an error envelope (subtype={subtype or 'unknown'!r}): "
         f"{detail or '(no terminal_reason reported)'}",
         kind="api" if any(m in lowered for m in _CLAUDE_TRANSIENT_MARKERS) else "permanent",
+        cost_usd=spent,
+        tokens_input=tok_in,
+        tokens_output=tok_out,
     )
+
+
+def _reported_usage(
+    envelope: dict, *, chosen_model: str
+) -> tuple[float | None, int, int]:
+    """`(cost_usd, tokens_input, tokens_output)` for a failed Claude attempt.
+
+    Cost resolution, in order:
+
+    1. `total_cost_usd` — authoritative, and reported even on subscription
+       sessions.
+    2. Otherwise estimate from the reported tokens at the RESOLVED model's
+       rate. The requested model is known at the call site, so `modelUsage`
+       (or the alias fallback) can resolve it; this is the same path the
+       success case already trusts.
+    3. Otherwise `None` — genuinely unknown. Not 0.0: a zero would be
+       indistinguishable from a free call and would quietly shrink the cost
+       cap's denominator.
+    """
+    tok_in, tok_out = _extract_claude_usage(envelope)
+
+    raw_cost = envelope.get("total_cost_usd")
+    if isinstance(raw_cost, (int, float)):
+        return float(raw_cost), tok_in, tok_out
+
+    if tok_in or tok_out:
+        resolved = _resolve_claude_model_id(envelope, fallback=chosen_model)
+        estimated = estimate_cost_usd(resolved, tok_in, tok_out)
+        # `estimate_cost_usd` returns 0.0 for a model with no rate row, which
+        # is the unknown case again rather than a free one.
+        if estimated:
+            return estimated, tok_in, tok_out
+
+    return None, tok_in, tok_out
 
 
 def _resolve_claude_model_id(envelope: dict, *, fallback: str) -> str:
