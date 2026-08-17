@@ -124,7 +124,7 @@ The skill loops until one of these exit reasons fires (priority order, per [§5.
 | `planner_locked` | Every finding this round was rejected by the planner |
 | `resolved` | Zero unresolved highs + zero open questions + every medium decided **and** no findings were accepted this round. Accepts produce edits that the next round's reviewer must validate, so a same-round `resolved` exit is suppressed when accepts are present — the loop continues to N+1 and converges via `approved` instead. |
 | `cost_capped` | Cumulative spend ≥ `ADVERSARIAL_MAX_COST_USD` (default `$5`) |
-| `ceiling_hit` | Round count ≥ `ADVERSARIAL_MAX_ROUNDS` (default `20`) |
+| `ceiling_hit` | Round count ≥ `ADVERSARIAL_MAX_ROUNDS` (defaults to `loop_state.DEFAULT_MAX_ROUNDS`) |
 | `resolved_with_deferrals` | One of the above fired with open items, and the user explicitly deferred them via `AskUserQuestion` |
 
 If the loop hits ceiling/cost-cap/planner-lock with open items, the **soft-block flow** asks the user to defer (with reasons + target versions for mediums), continue, or accept-all-risk. See [§5.4.1](plans/v2-plan.md#L557).
@@ -176,7 +176,7 @@ All are optional except `OPENAI_API_KEY` when using the OpenAI transport.
 
 | Variable | Default | Description |
 |---|---|---|
-| `ADVERSARIAL_MAX_ROUNDS` | `20` | Hard ceiling on review rounds (raised from v1's 10) |
+| `ADVERSARIAL_MAX_ROUNDS` | `loop_state.DEFAULT_MAX_ROUNDS` (`5`) | Hard ceiling on review rounds. Reaching it is a budget checkpoint, not a hard stop: with open items the soft-block asks you to continue, defer, or accept the risk. Raise for large/architectural plans. |
 | `ADVERSARIAL_MAX_COST_USD` | `5.0` | Per-run cost cap |
 | `ADVERSARIAL_BLOAT_THRESHOLD` | `0.20` | Plan-bloat trigger threshold (fractional growth) |
 | `ADVERSARIAL_BLOAT_WINDOW` | `3` | Plan-bloat lookback window (number of rounds) |

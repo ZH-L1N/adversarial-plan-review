@@ -229,7 +229,14 @@ def test_cli_check_exits_2_when_unconfigured(tmp_path, monkeypatch):
     """`first_run.py --check` must exit 2 when no transport available."""
     monkeypatch.setenv("PATH", "")
     monkeypatch.setenv("PATHEXT", "")
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    # Empty, not deleted. `_dotenv.load_local_env()` reads `<skill-root>/.env`
+    # — a path anchored to __file__, so no cwd change escapes it — and fills in
+    # any key the subprocess env lacks. Deleting OPENAI_API_KEY therefore hands
+    # the subprocess the developer's real key and the test can only pass on a
+    # machine that has none. An empty value is already in os.environ, so the
+    # loader leaves it alone (override=False), and every transport check reads
+    # it for truthiness.
+    monkeypatch.setenv("OPENAI_API_KEY", "")
     monkeypatch.delenv("ADVERSARIAL_TRANSPORT", raising=False)
     monkeypatch.delenv("CLAUDE_PLUGIN_ROOT", raising=False)
 

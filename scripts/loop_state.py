@@ -44,6 +44,11 @@ import render_markdown
 
 SCHEMA_VERSION = "2.0.0"
 
+# Hard ceiling on review rounds. Single source of truth: SKILL.md, README, and
+# .env.example all describe this value rather than restating a literal, so the
+# documented default cannot drift from the code the way v1's "10" did.
+DEFAULT_MAX_ROUNDS = 5
+
 
 # --- Enums and dataclasses ---------------------------------------------------
 
@@ -620,7 +625,7 @@ class ExitDecision:
 def evaluate_exit(
     state: RoundState,
     *,
-    max_rounds: int,
+    max_rounds: int = DEFAULT_MAX_ROUNDS,
     cumulative_cost_usd: float,
     cost_cap_usd: float,
 ) -> ExitDecision:

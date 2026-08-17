@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from loop_state import (
+    DEFAULT_MAX_ROUNDS,
     Deferral,
     ExitDecision,
     ExitReason,
@@ -154,6 +155,40 @@ def test_exit_ceiling_hit():
     decision = evaluate_exit(state, max_rounds=20, cumulative_cost_usd=0.5, cost_cap_usd=5.0)
     assert decision.reason == ExitReason.CEILING_HIT
     assert decision.needs_soft_block is True
+
+
+def test_default_max_rounds_is_five():
+    """The documented ceiling lives here, not in SKILL.md prose.
+
+    v1 let the default drift: the Termination section still read "Round 10"
+    long after the loop had moved to 20, because the number was only ever
+    written in markdown. Pin it in code so the docs can cite it instead.
+    """
+    assert DEFAULT_MAX_ROUNDS == 5
+
+
+def test_exit_ceiling_hit_uses_default_max_rounds():
+    """Omitting `max_rounds` applies DEFAULT_MAX_ROUNDS rather than erroring."""
+    finding = Finding("medium", "X", "Y", "Z", "W")
+    state = _state(
+        round_n=DEFAULT_MAX_ROUNDS,
+        review=_review(status="FINDINGS_PRESENT", findings=[finding]),
+    )
+    decision = evaluate_exit(state, cumulative_cost_usd=0.5, cost_cap_usd=5.0)
+    assert decision.reason == ExitReason.CEILING_HIT
+    assert decision.needs_soft_block is True
+
+
+def test_exit_below_default_ceiling_keeps_looping():
+    """The round before the default ceiling must not exit — guards an off-by-one."""
+    finding = Finding("medium", "X", "Y", "Z", "W")
+    state = _state(
+        round_n=DEFAULT_MAX_ROUNDS - 1,
+        review=_review(status="FINDINGS_PRESENT", findings=[finding]),
+        decisions=[],
+    )
+    decision = evaluate_exit(state, cumulative_cost_usd=0.5, cost_cap_usd=5.0)
+    assert decision.reason == ExitReason.NO_EXIT
 
 
 def test_exit_no_exit_sentinel_when_continuing():

@@ -51,6 +51,44 @@ def test_estimate_cost_known_model_claude_sonnet_5():
     assert cost == pytest.approx(expected)
 
 
+def test_estimate_cost_known_model_gpt56_terra():
+    """gpt-5.6-terra = $2/1M input + $12/1M output.
+
+    Pinned because the third-party aggregator figures (2.5/15) shipped in this
+    table's first draft; those overestimate spend and fire the cap early.
+    """
+    cost = estimate_cost_usd("gpt-5.6-terra", tokens_input=1_000_000, tokens_output=1_000_000)
+    assert cost == pytest.approx(2.0 + 12.0)
+
+
+def test_estimate_cost_known_model_gpt56_luna():
+    """gpt-5.6-luna = $0.20/1M in + $1.20/1M out — not the 1.0/6.0 aggregators list."""
+    cost = estimate_cost_usd("gpt-5.6-luna", tokens_input=1_000_000, tokens_output=1_000_000)
+    assert cost == pytest.approx(0.20 + 1.20)
+
+
+def test_estimate_cost_known_model_claude_fable_5():
+    """claude-fable-5 = $10/1M input + $50/1M output."""
+    cost = estimate_cost_usd("claude-fable-5", tokens_input=1000, tokens_output=500)
+    expected = (1000 * 10 + 500 * 50) / 1_000_000
+    assert cost == pytest.approx(expected)
+
+
+def test_every_claude_alias_target_has_a_rate_row():
+    """A resolved model with no rate row estimates as $0.00.
+
+    On the claude fallback path that silently disarms ADVERSARIAL_MAX_COST_USD,
+    so the alias map and the rate table have to stay in lockstep. Adding an
+    alias without its rate row should fail here, not in production.
+    """
+    from reviewer import CLAUDE_MODEL_ALIASES
+
+    for alias, canonical in CLAUDE_MODEL_ALIASES.items():
+        assert estimate_cost_usd(canonical, 1_000_000, 0) > 0.0, (
+            f"alias {alias!r} resolves to {canonical!r}, which has no rate row"
+        )
+
+
 def test_estimate_cost_claude_cli_alias_is_not_a_rate_row():
     """The `opus` CLI alias must never reach the rate table — resolve first."""
     assert estimate_cost_usd("opus", 1_000_000, 1_000_000) == 0.0

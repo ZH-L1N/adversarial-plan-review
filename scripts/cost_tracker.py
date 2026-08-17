@@ -15,10 +15,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-# Per-1M-token rates in USD. Source: v2-plan §3 + April 2026 gpt-5.5 release
-# notes + July 2026 gpt-5.6 launch pricing. Operators on different tiers can
-# override the `gpt*` rows via OPENAI_INPUT_USD_PER_1M /
-# OPENAI_OUTPUT_USD_PER_1M env vars without code changes.
+# Per-1M-token rates in USD. Source: the official pricing pages —
+# developers.openai.com/api/docs/pricing and platform.claude.com/docs/en/pricing.
+# Take the OpenAI rows from that page ONLY: third-party aggregators publish
+# inflated terra/luna figures (2.5/15 and 1.0/6.0 instead of 2.0/12 and
+# 0.20/1.20), which is where this table's first draft went wrong.
+# Operators on different tiers can override the `gpt*` rows via
+# OPENAI_INPUT_USD_PER_1M / OPENAI_OUTPUT_USD_PER_1M env vars without code
+# changes.
 # Note: gpt-5.6 charges 2x input / 1.5x output on requests >272K input tokens;
 # plan reviews stay far below that, so the standard rates are used here.
 #
@@ -30,15 +34,21 @@ from pathlib import Path
 _DEFAULT_RATES: dict[str, tuple[float, float]] = {
     "gpt-5.6-sol": (5.0, 30.0),
     "gpt-5.6": (5.0, 30.0),  # bare alias routes to sol
-    "gpt-5.6-terra": (2.5, 15.0),
-    "gpt-5.6-luna": (1.0, 6.0),
+    "gpt-5.6-terra": (2.0, 12.0),
+    "gpt-5.6-luna": (0.20, 1.20),
+    "gpt-5.6-cyber": (12.50, 75.0),
     "gpt-5.5": (5.0, 30.0),
     "gpt-5.5-pro": (30.0, 180.0),
     "gpt-5.4": (5.0, 30.0),
     "gpt-5": (5.0, 30.0),
     "gpt-5-mini": (1.0, 4.0),
+    # Every id `_CLAUDE_MODEL_ALIASES` can resolve to needs a row: an unknown
+    # model estimates as $0.00, which silently disarms the cost cap on the
+    # fallback path.
+    "claude-fable-5": (10.0, 50.0),
     "claude-opus-5": (5.0, 25.0),
     "claude-sonnet-5": (3.0, 15.0),
+    "claude-haiku-4-5": (1.0, 5.0),
 }
 
 

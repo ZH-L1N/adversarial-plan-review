@@ -72,7 +72,8 @@ Stop. Re-read this section. Report what you were about to do, and ask the user w
 
 Exit reasons and their gates are defined by step 7's `evaluate_exit` table
 below: `approved`, `resolved`, `resolved_with_deferrals`, `planner_locked`,
-`ceiling_hit` (`ADVERSARIAL_MAX_ROUNDS`, default 20), `cost_capped`.
+`ceiling_hit` (`ADVERSARIAL_MAX_ROUNDS`, defaulting to `loop_state.DEFAULT_MAX_ROUNDS`),
+`cost_capped`.
 
 ## Reviewer transports
 
@@ -475,11 +476,11 @@ Call `loop_state.evaluate_exit()` with the populated `RoundState`:
 python -c "
 import sys, os
 sys.path.insert(0, '<skill-dir>/scripts')
-from loop_state import evaluate_exit, ExitReason
+from loop_state import evaluate_exit, ExitReason, DEFAULT_MAX_ROUNDS
 
 decision = evaluate_exit(
     state,
-    max_rounds=int(os.environ.get('ADVERSARIAL_MAX_ROUNDS', '20')),
+    max_rounds=int(os.environ.get('ADVERSARIAL_MAX_ROUNDS', str(DEFAULT_MAX_ROUNDS))),
     cumulative_cost_usd=cumulative_cost,
     cost_cap_usd=float(os.environ.get('ADVERSARIAL_MAX_COST_USD', '5.0')),
 )
@@ -495,7 +496,7 @@ Possible outcomes (in priority order — `evaluate_exit` evaluates them in this 
 | `planner_locked` | Every finding this round was rejected (must be checked before `resolved` since rejections count as "decided") | **Soft-block** if open items remain; else exit |
 | `resolved` | Zero unresolved highs + zero open questions + every medium decided **AND no findings were accepted this round** (accepts produce edits that need a follow-up review round to validate; this exit fires only when decisions exist but none were accepts — a narrow case in practice) | **Exit**: clean by design |
 | `cost_capped` | Cumulative cost ≥ `ADVERSARIAL_MAX_COST_USD` (default $5) | **Soft-block** if `decision.needs_soft_block`; else exit |
-| `ceiling_hit` | `round_n >= ADVERSARIAL_MAX_ROUNDS` (default 20) | **Soft-block** if open items remain; else exit |
+| `ceiling_hit` | `round_n >= ADVERSARIAL_MAX_ROUNDS` (defaults to `loop_state.DEFAULT_MAX_ROUNDS`) | **Soft-block** if open items remain; else exit |
 | `no_exit` | None of the above | N++, go back to step 1 |
 
 Note: the `resolved_with_deferrals` reason is NOT returned directly by `evaluate_exit`; it is produced by calling `escalate_to_resolved_with_deferrals(decision, deferrals)` after the user completes the soft-block deferral flow described below.
