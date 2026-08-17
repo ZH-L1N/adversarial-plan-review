@@ -725,6 +725,12 @@ def evaluate_exit(
     # item, so the gate and the list the soft-block enumerates cannot disagree.
     # A second independent count could fire the gate with nothing to show.
     has_accepts = bool(unvalidated_accepts)
+    # Computed before EVERY terminal return, not only the cap/ceiling pair. An
+    # unpriceable attempt makes the round's cost a known lower bound, so a
+    # clean-looking exit — NO_FINDINGS, all-rejected, resolved — would end the
+    # loop on a total we know is incomplete. Checking it only at the cap left
+    # exactly those three routes unguarded.
+    accounting_incomplete = not state.cost_accounting_complete
 
     # 1. Approved: reviewer returned NO_FINDINGS (schema guarantees no open
     #    questions either, so no follow-up needed).
@@ -734,7 +740,7 @@ def evaluate_exit(
             open_highs=[],
             open_mediums=[],
             open_questions=[],
-            needs_soft_block=False,
+            needs_soft_block=accounting_incomplete,
         )
 
     # 2. Planner-locked: every finding this round was rejected. Code-review
@@ -747,7 +753,8 @@ def evaluate_exit(
             open_highs=open_highs,
             open_mediums=open_mediums,
             open_questions=open_questions,
-            needs_soft_block=bool(open_highs or open_mediums or open_questions),
+            needs_soft_block=bool(open_highs or open_mediums or open_questions)
+            or accounting_incomplete,
         )
 
     # 3. Resolved: zero unresolved highs + zero open questions + every
@@ -768,14 +775,10 @@ def evaluate_exit(
                 open_highs=[],
                 open_mediums=[],
                 open_questions=[],
-                needs_soft_block=False,
+                needs_soft_block=accounting_incomplete,
             )
 
     has_open = bool(open_highs or open_mediums or open_questions)
-    # A round with an unpriceable attempt reports a lower bound, so the cap may
-    # already have been passed without firing. Surface it rather than exiting
-    # on a number we know is incomplete.
-    accounting_incomplete = not state.cost_accounting_complete
 
     # Branches 4 and 5 end the loop, so they inherit the RESOLVED accept guard:
     # a round whose findings were all accepted has zero OPEN items, and gating

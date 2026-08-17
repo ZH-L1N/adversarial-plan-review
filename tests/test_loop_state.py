@@ -1064,3 +1064,28 @@ def test_complete_accounting_leaves_the_gate_alone():
     decision = evaluate_exit(state, cumulative_cost_usd=0.5, cost_cap_usd=5.0)
     assert decision.reason == ExitReason.APPROVED
     assert decision.needs_soft_block is False
+
+
+@pytest.mark.parametrize("build,expected_reason", [
+    (lambda: _state(review=_review(status="NO_FINDINGS")), ExitReason.APPROVED),
+    (
+        lambda: _state(
+            review=_review(status="FINDINGS_PRESENT",
+                           findings=[Finding("medium", "c", "X", "fix", "ev")]),
+            decisions=[PlannerDecision("f_r1_1", "reject", "no")],
+        ),
+        ExitReason.PLANNER_LOCKED,
+    ),
+])
+def test_incomplete_accounting_blocks_every_clean_exit(build, expected_reason):
+    """The safeguard must precede the early clean returns, not follow them.
+
+    Checking it only at the cost-cap branch left NO_FINDINGS, all-rejected and
+    resolved rounds exiting on a cost we know is a lower bound — and the first
+    incomplete-accounting test reached only the cap branch, so it missed them.
+    """
+    state = build()
+    state.cost_accounting_complete = False
+    decision = evaluate_exit(state, cumulative_cost_usd=0.5, cost_cap_usd=5.0)
+    assert decision.reason == expected_reason
+    assert decision.needs_soft_block is True

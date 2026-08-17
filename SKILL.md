@@ -241,6 +241,8 @@ print(json.dumps({
   # The round's running total, not the round's own cost. Nothing else computes
   # this: pass the result back as CUMULATIVE_COST next round and persist it in
   # step 6, or round 2 records round 1's figure.
+  # new_cumulative_cost — carry this into steps 6 and 7, and into the next
+  # round as CUMULATIVE_COST. Nothing else computes it.
   'cumulative_cost_usd': round(CUMULATIVE_COST + outcome.total_cost_usd, 4),
   'cost_accounting_complete': outcome.cost_complete,
   'attempts': [a.__dict__ for a in outcome.attempts],
@@ -354,12 +356,16 @@ state = RoundState(
     # False means stats.cost_usd is a known LOWER BOUND. step 7 then forces a
     # soft-block rather than exiting on a total we know is incomplete.
     cost_accounting_complete=outcome.cost_complete,
-    cumulative_cost_usd=CUMULATIVE_COST + outcome.total_cost_usd,
     decisions=[PlannerDecision(...) for ...], # one per finding/open-question
     plan_edits=[PlanEdit(...) for ...],       # one per applied edit
     plan_content_at_end=Path('plans/<version>-<slug>.md').read_text(encoding='utf-8'),
     baseline_plan_content=BASELINE_TEXT_IF_ROUND_1_ELSE_NONE,
-    cumulative_cost_usd=cumulative_cost,
+    # ONE authoritative running total, computed once above as
+    #   new_cumulative_cost = CUMULATIVE_COST + outcome.total_cost_usd
+    # and passed to BOTH this constructor and evaluate_exit in step 7. Two
+    # names for this diverge silently: the sidecar records one figure and the
+    # cost gate decides on another.
+    cumulative_cost_usd=new_cumulative_cost,
     duration_seconds=time.time() - round_start_epoch,
     plan_size_delta=current_plan_size - previous_plan_size,
 )
@@ -452,7 +458,7 @@ from loop_state import evaluate_exit, ExitReason, DEFAULT_MAX_ROUNDS
 decision = evaluate_exit(
     state,
     max_rounds=int(os.environ.get('ADVERSARIAL_MAX_ROUNDS', str(DEFAULT_MAX_ROUNDS))),
-    cumulative_cost_usd=cumulative_cost,
+    cumulative_cost_usd=new_cumulative_cost,  # the SAME value step 6 persisted
     cost_cap_usd=float(os.environ.get('ADVERSARIAL_MAX_COST_USD', '5.0')),
 )
 print(decision.reason.value, decision.needs_soft_block)
