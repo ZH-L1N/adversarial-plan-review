@@ -1,7 +1,7 @@
 # Adversarial Plan Review — v2 Plan
 
 > Status: transport/diff/severity-gate core is design-locked and ready for Phase 1+2 implementation. Residual risk after 16 rounds of dogfooded review sits in the round-13/14/15 exit-audit additions (`deferrals_at_exit` schema, open-question identity, `accept_all_risk` sentinel, sidecar-form schema for populated open_questions) — all addressed but warrant a fresh-context verification pass before declaring fully implementation-ready. (Banner/footer parity confirmed in round 16 finding 1.)
-> Author: Claude (planner), with decisions from user (zlin@exowatt.com).
+> Author: Claude (planner), with decisions from user (ZH-L1N).
 > Source context: real failure mode observed on `Optical-LCOE/plans/fixs/v0.0.5-torque-sizing-bom-decomp-fixes.md` (16 rounds, 47 findings, plan-bloat-driven reviewer hallucination in round 14).
 
 ---

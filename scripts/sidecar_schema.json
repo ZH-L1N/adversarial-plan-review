@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://exowatt-labs.github.io/adversarial-plan-review/sidecar_schema.json",
+  "$id": "https://zh-l1n.github.io/adversarial-plan-review/sidecar_schema.json",
   "title": "Adversarial Plan Review — Round Sidecar (v2.1.0)",
   "description": "Per-round JSON sidecar. Authoritative source of truth for the loop state machine. The markdown fixes-md is rendered FROM this. See plans/v2-plan.md §5.7. v2.1.0 widened the `transport` enum with \"claude\" (enum widening is backward-compatible for old readers).",
   "type": "object",

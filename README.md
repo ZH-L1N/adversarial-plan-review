@@ -18,19 +18,10 @@ Don't use it for:
 
 ## Install
 
-The skill is distributed as a Claude Code plugin. Two ways to install:
-
-### From the Claude Code marketplace
-
-```
-/plugin marketplace add Exowatt-Labs/adversarial-plan-review
-/plugin install adversarial-plan-review
-```
-
-### Directly into your skills directory
+Clone the repo directly into your skills directory:
 
 ```bash
-git clone https://github.com/Exowatt-Labs/adversarial-plan-review.git ~/.claude/skills/adversarial-plan-review
+git clone https://github.com/ZH-L1N/adversarial-plan-review.git ~/.claude/skills/adversarial-plan-review
 ```
 
 Restart Claude Code (or start a new session). Trigger the skill by saying *"adversarial plan review"*, *"GAN review my plan"*, or *"codex-review my plan"* once you have a plan markdown file under `plans/`.
