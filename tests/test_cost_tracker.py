@@ -10,6 +10,7 @@ from cost_tracker import (
     CumulativeCostTracker,
     cap_threshold_usd,
     estimate_cost_usd,
+    restore_accounting_complete_from_sidecars,
     restore_cumulative_from_sidecars,
 )
 
@@ -244,3 +245,32 @@ def test_restore_cumulative_handles_corrupt_json(tmp_path):
     fixs.mkdir()
     (fixs / "v1-test-round-1.json").write_text("not json")
     assert restore_cumulative_from_sidecars(fixs, "test", "v1") == 0.0
+
+
+def test_accounting_completeness_is_cumulative(tmp_path):
+    """One unpriced round taints the running total for every later round.
+
+    Round N has an unpriceable attempt and returns NO_EXIT; round N+1 is fully
+    priced and clean. Without carrying the flag forward, N+1 exits APPROVED on
+    a cumulative cost that is still only a lower bound.
+    """
+    def write(round_n, complete):
+        (tmp_path / f"v0-demo-round-{round_n}.json").write_text(
+            json.dumps({"round": round_n, "cost_accounting_complete": complete}),
+            encoding="utf-8",
+        )
+
+    write(1, True)
+    assert restore_accounting_complete_from_sidecars(tmp_path, "demo", "v0") is True
+
+    write(2, False)          # an attempt could not be priced
+    write(3, True)           # a later round is clean on its own
+    assert restore_accounting_complete_from_sidecars(tmp_path, "demo", "v0") is False
+
+
+def test_legacy_sidecars_without_the_flag_count_as_complete(tmp_path):
+    """The field postdates them; assuming incomplete would block every resume."""
+    (tmp_path / "v0-demo-round-1.json").write_text(
+        json.dumps({"round": 1}), encoding="utf-8"
+    )
+    assert restore_accounting_complete_from_sidecars(tmp_path, "demo", "v0") is True

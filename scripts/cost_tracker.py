@@ -164,6 +164,31 @@ def restore_cumulative_from_sidecars(fixs_dir: Path, slug: str, version: str) ->
     return float(cumulative)
 
 
+def restore_accounting_complete_from_sidecars(
+    fixs_dir: Path, slug: str, version: str
+) -> bool:
+    """Whether EVERY round so far could be fully priced.
+
+    Completeness is cumulative, because the number it qualifies is. One round
+    with an unpriceable attempt makes the running total a lower bound for the
+    whole run — so a later, fully-priced round must not report the accounting
+    as complete and exit cleanly on a figure that is still short. Read this,
+    AND it with the current round's own flag, and persist the conjunction.
+
+    Missing on older sidecars is treated as complete: they predate the flag,
+    and assuming otherwise would block every resumed legacy run.
+    """
+    pattern = f"{version}-{slug}-round-*.json"
+    for path in sorted(fixs_dir.glob(pattern)):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if data.get("cost_accounting_complete") is False:
+            return False
+    return True
+
+
 def _round_number_from_path(path: Path, slug: str, version: str) -> int:
     """Extract the round number from a sidecar path, for sort ordering."""
     prefix = f"{version}-{slug}-round-"

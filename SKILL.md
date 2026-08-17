@@ -234,6 +234,12 @@ outcome = run_review_round(
 )
 
 new_cumulative_cost = round(CUMULATIVE_COST + outcome.total_cost_usd, 4)
+# Completeness is cumulative for the same reason the cost is.
+accounting_complete = (
+    cost_tracker.restore_accounting_complete_from_sidecars(
+        Path('plans/fixs'), SLUG, VERSION)
+    and outcome.cost_complete
+)
 
 print(json.dumps({
   'status': outcome.result.status,
@@ -248,7 +254,7 @@ print(json.dumps({
   # this: pass the result back as CUMULATIVE_COST next round and persist it in
   # step 6, or round 2 records round 1's figure.
   'cumulative_cost_usd': new_cumulative_cost,
-  'cost_accounting_complete': outcome.cost_complete,
+  'cost_accounting_complete': accounting_complete,
   'attempts': [a.__dict__ for a in outcome.attempts],
   'raw_response_text': outcome.result.raw_response_text,
 }))
@@ -357,9 +363,13 @@ state = RoundState(
     round_usage=ReviewUsage(outcome.tokens_input, outcome.tokens_output,
                             outcome.total_cost_usd),
     reviewer_attempts=[a.__dict__ for a in outcome.attempts],
-    # False means stats.cost_usd is a known LOWER BOUND. step 7 then forces a
-    # soft-block rather than exiting on a total we know is incomplete.
-    cost_accounting_complete=outcome.cost_complete,
+    # CUMULATIVE, not per-round: one unpriceable attempt makes the running
+    # total a lower bound for the whole run, so a later fully-priced round must
+    # not report complete and exit cleanly on a figure that is still short.
+    #   prior = cost_tracker.restore_accounting_complete_from_sidecars(
+    #               Path('plans/fixs'), SLUG, VERSION)
+    #   accounting_complete = prior and outcome.cost_complete
+    cost_accounting_complete=accounting_complete,
     decisions=[PlannerDecision(...) for ...], # one per finding/open-question
     plan_edits=[PlanEdit(...) for ...],       # one per applied edit
     plan_content_at_end=Path('plans/<version>-<slug>.md').read_text(encoding='utf-8'),
