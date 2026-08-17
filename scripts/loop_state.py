@@ -341,6 +341,12 @@ def build_sidecar(state: RoundState, *, raw_response_text: str) -> dict[str, Any
     """Materialize the JSON sidecar from a populated RoundState."""
     if state.reviewer_response is None:
         raise ValueError("RoundState.reviewer_response must be set before build_sidecar")
+    # Before serialization, not after. `evaluate_exit` runs this too, but it
+    # runs at step 7 — by then step 6 has already written and rendered the
+    # sidecar, so a malformed decision would be baked into the authoritative
+    # audit record and only *then* raise. Validating here means malformed
+    # state is not buildable at all.
+    _validate_decision_ids(state)
 
     plan_bytes = state.plan_content_at_end.encode("utf-8")
     plan_sha = hashlib.sha256(plan_bytes).hexdigest()
@@ -505,6 +511,36 @@ class ResumeIntegrityError(RuntimeError):
     """Sidecar audit trail is corrupt; resume cannot proceed safely."""
 
 
+def _validate_decision_referential_integrity(sidecar: dict[str, Any]) -> None:
+    """The serialized-form twin of `_validate_decision_ids`.
+
+    JSON Schema can express shape but not "this item_id names a finding that
+    exists in this same document", so a sidecar written before that invariant
+    was enforced — or hand-edited since — would sail through `validate_sidecar`
+    and be trusted on resume. Checked here so a malformed historical sidecar is
+    rejected rather than silently believed.
+    """
+    response = sidecar.get("reviewer_response") or {}
+    known = {f.get("id") for f in response.get("findings", [])}
+    known |= {oq.get("id") for oq in response.get("open_questions", [])}
+
+    seen: set[str] = set()
+    for decision in sidecar.get("planner_decisions", []):
+        if decision.get("decision") == "uncertain":
+            continue
+        item_id = decision.get("item_id")
+        if item_id not in known:
+            raise SidecarSchemaError(
+                f"planner_decisions names unknown item_id {item_id!r}; this "
+                f"sidecar's items are {sorted(i for i in known if i)}"
+            )
+        if item_id in seen:
+            raise SidecarSchemaError(
+                f"duplicate planner decision for item_id {item_id!r}"
+            )
+        seen.add(item_id)
+
+
 def validate_sidecar(sidecar: dict[str, Any]) -> None:
     """Validate sidecar against `sidecar_schema.json`.
 
@@ -516,6 +552,7 @@ def validate_sidecar(sidecar: dict[str, Any]) -> None:
         import jsonschema  # type: ignore[import-not-found]
     except ImportError:
         _structural_sanity_check(sidecar)
+        _validate_decision_referential_integrity(sidecar)
         return
 
     schema_path = Path(__file__).resolve().parent / "sidecar_schema.json"
@@ -544,6 +581,10 @@ def validate_sidecar(sidecar: dict[str, Any]) -> None:
                 f"declared {sidecar['baseline_plan_content_sha256'][:8]}…, "
                 f"computed {actual_baseline[:8]}…"
             )
+
+    # Same class of gap as the hashes above: schema can express shape, not
+    # "this decision names an item that exists in this document".
+    _validate_decision_referential_integrity(sidecar)
 
 
 class SidecarSchemaError(RuntimeError):
@@ -620,6 +661,17 @@ class ExitDecision:
     open_mediums: list[str]
     open_questions: list[str]
     needs_soft_block: bool  # True if exit requires §5.4.1 soft-block UX
+    # Items accepted THIS round, whose resulting plan edits no reviewer has
+    # seen. These are NOT open — they are decided — so the `open_*` lists
+    # deliberately exclude them, but a cap/ceiling exit here still ends the
+    # loop on an unvalidated plan. That is precisely what the RESOLVED
+    # branch's accept guard below exists to prevent, so the cap and ceiling
+    # branches have to honour it too. Carried as (item_id, severity) pairs so
+    # the §5.4.1 deferral flow can enumerate and persist them the same way it
+    # does open items. Severities use the deferral schema's own vocabulary
+    # (`high`/`medium`/`low`/`open_question`) so a pair converts to a
+    # `Deferral` directly.
+    unvalidated_accepts: list[tuple[str, str]] = field(default_factory=list)
 
 
 def evaluate_exit(
@@ -638,7 +690,14 @@ def evaluate_exit(
     if state.reviewer_response is None:
         raise ValueError("evaluate_exit requires reviewer_response set")
 
+    _validate_decision_ids(state)
     open_highs, open_mediums, open_questions = _open_items(state)
+    unvalidated_accepts = _unvalidated_accepts(state)
+    # Derived from the enumeration, not counted separately over raw decisions:
+    # `_validate_decision_ids` has just guaranteed every accept maps to a real
+    # item, so the gate and the list the soft-block enumerates cannot disagree.
+    # A second independent count could fire the gate with nothing to show.
+    has_accepts = bool(unvalidated_accepts)
 
     # 1. Approved: reviewer returned NO_FINDINGS (schema guarantees no open
     #    questions either, so no follow-up needed).
@@ -676,9 +735,6 @@ def evaluate_exit(
     #    present we fall through to NO_EXIT and let round N+1's reviewer
     #    deliver the verdict on the edited plan.
     if not open_highs and not open_mediums and not open_questions:
-        has_accepts = any(
-            d.decision in ("accept", "accept_via_user") for d in state.decisions
-        )
         if not has_accepts:
             return ExitDecision(
                 reason=ExitReason.RESOLVED,
@@ -690,6 +746,12 @@ def evaluate_exit(
 
     has_open = bool(open_highs or open_mediums or open_questions)
 
+    # Branches 4 and 5 end the loop, so they inherit the RESOLVED accept guard:
+    # a round whose findings were all accepted has zero OPEN items, and gating
+    # the soft-block on `has_open` alone let it exit silently on a plan no
+    # reviewer had read. Rare at a ceiling of 20, ordinary at 5.
+    exit_needs_block = has_open or has_accepts
+
     # 4. Cost-cap exit (forces user input via soft-block when items remain)
     if cumulative_cost_usd >= cost_cap_usd:
         return ExitDecision(
@@ -697,7 +759,8 @@ def evaluate_exit(
             open_highs=open_highs,
             open_mediums=open_mediums,
             open_questions=open_questions,
-            needs_soft_block=has_open,
+            needs_soft_block=exit_needs_block,
+            unvalidated_accepts=unvalidated_accepts,
         )
 
     # 5. Ceiling
@@ -707,7 +770,8 @@ def evaluate_exit(
             open_highs=open_highs,
             open_mediums=open_mediums,
             open_questions=open_questions,
-            needs_soft_block=has_open,
+            needs_soft_block=exit_needs_block,
+            unvalidated_accepts=unvalidated_accepts,
         )
 
     # 6. No exit yet — caller continues to N+1. Code-review C2: explicit
@@ -719,6 +783,10 @@ def evaluate_exit(
         open_mediums=open_mediums,
         open_questions=open_questions,
         needs_soft_block=False,
+        # Populated here too so the field means the same thing on every
+        # branch. It needs no handling on this path: the loop continues, and
+        # round N+1's reviewer is the validation these items are waiting for.
+        unvalidated_accepts=unvalidated_accepts,
     )
 
 
@@ -737,9 +805,12 @@ def escalate_to_resolved_with_deferrals(
 
     Caller passes the original `ExitDecision` from `evaluate_exit()` plus
     the list of `Deferral` objects collected by SKILL.md's soft-block flow.
-    The new decision keeps the open_* lists (so the end-report can still
-    enumerate what was deferred) but flips reason → RESOLVED_WITH_DEFERRALS
-    and needs_soft_block → False.
+    The new decision keeps the open_* lists AND `unvalidated_accepts` (so the
+    end-report can still enumerate everything that was deferred) but flips
+    reason → RESOLVED_WITH_DEFERRALS and needs_soft_block → False. Carrying
+    `unvalidated_accepts` forward is not optional: it has a default, so
+    omitting it here silently resets it to empty and the end report loses
+    exactly the skipped-validation items this escalation was meant to record.
     """
     if not deferrals:
         # No deferrals collected; original decision stands.
@@ -750,6 +821,7 @@ def escalate_to_resolved_with_deferrals(
         open_mediums=decision.open_mediums,
         open_questions=decision.open_questions,
         needs_soft_block=False,
+        unvalidated_accepts=decision.unvalidated_accepts,
     )
 
 
@@ -784,6 +856,74 @@ def _open_items(state: RoundState) -> tuple[list[str], list[str], list[str]]:
         oq.id for oq in state.reviewer_response.open_questions if oq.id not in decided_ids
     ]
     return open_highs, open_mediums, open_questions
+
+
+def _validate_decision_ids(state: RoundState) -> None:
+    """Every decided item_id must name something in this round's response.
+
+    This is what lets the exit gate and its audit payload share one source of
+    truth. Without it, an accept carrying a typoed or stale `item_id` makes
+    the gate fire while `_unvalidated_accepts` finds nothing to enumerate, so
+    the soft-block appears with zero items to show the user or persist as
+    deferrals — a prompt that cannot be answered and an exit that cannot be
+    audited, which is worse than either failure alone.
+    """
+    if state.reviewer_response is None:
+        return
+
+    known = {
+        f"f_r{state.round_n}_{i}"
+        for i in range(1, len(state.reviewer_response.findings) + 1)
+    }
+    known |= {oq.id for oq in state.reviewer_response.open_questions}
+
+    seen: set[str] = set()
+    for d in state.decisions:
+        if d.decision == "uncertain":
+            continue
+        if d.item_id not in known:
+            raise ValueError(
+                f"decision names unknown item_id {d.item_id!r} in round "
+                f"{state.round_n}; this round's items are {sorted(known)}"
+            )
+        if d.item_id in seen:
+            raise ValueError(
+                f"duplicate decision for item_id {d.item_id!r} in round {state.round_n}"
+            )
+        seen.add(d.item_id)
+
+
+def _unvalidated_accepts(state: RoundState) -> list[tuple[str, str]]:
+    """Items accepted this round, as (item_id, severity) pairs.
+
+    Accepting a finding produces a plan edit, and no reviewer has read the
+    edited plan yet — round N+1's reviewer is what confirms the edit actually
+    closed the finding instead of introducing a new problem. `_open_items`
+    correctly excludes these (they are decided), which is why the cap and
+    ceiling branches need this second list to avoid exiting on an unvalidated
+    plan. Answering an open question also steers plan edits, so those are
+    included too, carrying the severity `"open_question"` — the vocabulary the
+    deferral schema's enum already uses, so these pairs can be turned into
+    `Deferral`s at exit without a translation step.
+    """
+    if state.reviewer_response is None:
+        return []
+
+    accepted_ids = {
+        d.item_id
+        for d in state.decisions
+        if d.decision in ("accept", "accept_via_user")
+    }
+
+    out: list[tuple[str, str]] = []
+    for i, finding in enumerate(state.reviewer_response.findings, start=1):
+        fid = f"f_r{state.round_n}_{i}"
+        if fid in accepted_ids:
+            out.append((fid, finding.severity))
+    for oq in state.reviewer_response.open_questions:
+        if oq.id in accepted_ids:
+            out.append((oq.id, "open_question"))
+    return out
 
 
 def _all_rejected(decisions: list[PlannerDecision]) -> bool:

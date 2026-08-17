@@ -276,9 +276,19 @@ def test_invoke_claude_argv_carries_containment_flags(
     # settings isolation: no inherited bypassPermissions / hooks / CLAUDE.md priors
     assert cmd[cmd.index("--setting-sources") + 1] == ""
     assert "--strict-mcp-config" in cmd
-    # tool SET restricted AND pre-granted, plus the write/git/rm floor
-    assert cmd[cmd.index("--tools") + 1] == "Read,Grep,Glob,Bash"
-    assert cmd[cmd.index("--allowedTools") + 1] == "Read,Grep,Glob,Bash"
+    # The tool SET and the pre-granted subset are deliberately NOT the same.
+    # Bash stays in the set so Claude Code's own read-only command recognition
+    # can serve `git log` / `git show` / `stat` — the repo verification this
+    # transport exists for — but pre-granting it would hand the reviewer a
+    # write primitive that the prefix deny floor below cannot close
+    # (`printf x > plan.md`, `sed -i`, `python -c`, `tee`). Ungranted means
+    # escalation, and escalation under `--setting-sources ""` is a real denial.
+    tool_set = cmd[cmd.index("--tools") + 1]
+    pre_granted = cmd[cmd.index("--allowedTools") + 1]
+    assert tool_set == "Read,Grep,Glob,Bash"
+    assert pre_granted == "Read,Grep,Glob"
+    assert "Bash" in tool_set.split(",")
+    assert "Bash" not in pre_granted.split(",")
     disallowed = cmd[cmd.index("--disallowedTools") + 1]
     for denied in (
         "Write",
@@ -296,6 +306,54 @@ def test_invoke_claude_argv_carries_containment_flags(
     ):
         assert denied in disallowed
     assert cmd[cmd.index("--max-budget-usd") + 1] == "5.0"
+
+
+def test_env_cannot_widen_either_tool_value(monkeypatch, tmp_path):
+    """`ADVERSARIAL_CLAUDE_TOOLS` states a request, not a grant.
+
+    It is read from an environment `load_local_env()` populates from
+    `<cwd>/.env` — and cwd is the repository under review — so a reviewed repo
+    could otherwise smuggle tools into the reviewer inspecting it. Absent from
+    `--allowedTools` is not enough: the containment probe showed Claude Code
+    runs ungranted commands it classifies read-only, so an unexpected tool in
+    the SET could execute without ever appearing in the grant.
+    """
+    monkeypatch.setenv(
+        "ADVERSARIAL_CLAUDE_TOOLS", "Read,Grep,Glob,Bash,WebSearch,WebFetch,Agent"
+    )
+    fake = _FakeRun(json.dumps(_claude_envelope()))
+    monkeypatch.setattr(reviewer.subprocess, "run", fake)
+
+    _invoke_claude("p", round_n=1, model=None, repo_root=str(tmp_path))
+    cmd = fake.calls[0]["cmd"]
+
+    for smuggled in ("WebSearch", "WebFetch", "Agent"):
+        assert smuggled not in cmd[cmd.index("--tools") + 1]
+        assert smuggled not in cmd[cmd.index("--allowedTools") + 1]
+
+
+def test_env_can_still_narrow_to_a_shell_free_reviewer(monkeypatch, tmp_path):
+    """Narrowing is the supported direction, and it narrows the grant with it."""
+    monkeypatch.setenv("ADVERSARIAL_CLAUDE_TOOLS", "Read,Grep,Glob")
+    fake = _FakeRun(json.dumps(_claude_envelope()))
+    monkeypatch.setattr(reviewer.subprocess, "run", fake)
+
+    _invoke_claude("p", round_n=1, model=None, repo_root=str(tmp_path))
+    cmd = fake.calls[0]["cmd"]
+
+    assert cmd[cmd.index("--tools") + 1] == "Read,Grep,Glob"
+    assert cmd[cmd.index("--allowedTools") + 1] == "Read,Grep,Glob"
+
+
+def test_disjoint_tool_request_fails_closed(monkeypatch, tmp_path):
+    """An empty intersection must fail loudly, never degrade to a broader set."""
+    monkeypatch.setenv("ADVERSARIAL_CLAUDE_TOOLS", "Write,Edit")
+    fake = _FakeRun(json.dumps(_claude_envelope()))
+    monkeypatch.setattr(reviewer.subprocess, "run", fake)
+
+    with pytest.raises(reviewer.TransportError, match="requested no tool"):
+        _invoke_claude("p", round_n=1, model=None, repo_root=str(tmp_path))
+    assert fake.calls == []  # never reached the CLI
 
 
 def test_invoke_claude_pins_max_turns_flag(monkeypatch, clean_claude_env, tmp_path):
@@ -435,12 +493,20 @@ def test_invoke_claude_overload_error_envelope_is_transient(
     assert exc.value.is_transient is True
 
 
-def test_invoke_claude_timeout_is_transient(monkeypatch, clean_claude_env, tmp_path):
+def test_invoke_claude_timeout_is_not_retried(monkeypatch, clean_claude_env, tmp_path):
+    """A wall-clock timeout is a distinct kind and must NOT be retried.
+
+    It used to be lumped in with rate limits under one `is_transient` boolean.
+    Retrying inherits the same timeout, so a single round would spend
+    2 x ADVERSARIAL_CLAUDE_TIMEOUT_S — 40 minutes at the default — and still
+    fail.
+    """
     fake = _FakeRun("", raises=subprocess.TimeoutExpired(cmd=["claude"], timeout=1200))
     monkeypatch.setattr(reviewer.subprocess, "run", fake)
     with pytest.raises(TransportError) as exc:
         _invoke_claude("p", round_n=1, model=None, repo_root=str(tmp_path))
-    assert exc.value.is_transient is True
+    assert exc.value.kind == "wall_timeout"
+    assert exc.value.is_transient is False
     assert "1200" in str(exc.value)
 
 
@@ -768,9 +834,27 @@ def test_transport_error_default_not_transient():
     assert err.is_transient is False
 
 
-def test_transport_error_can_be_transient():
-    err = TransportError("rate limited", is_transient=True)
-    assert err.is_transient is True
+def test_transport_error_kind_drives_the_retry_contract():
+    """`is_transient` is derived from `kind`, never set independently."""
+    assert TransportError("rate limited", kind="api").is_transient is True
+    assert TransportError("turns used up", kind="max_turns").is_transient is True
+    assert TransportError("budget used up", kind="max_budget").is_transient is True
+    assert TransportError("timed out", kind="wall_timeout").is_transient is False
+    assert TransportError("bad key", kind="permanent").is_transient is False
+    assert TransportError("no credit", kind="quota").is_transient is False
+
+
+def test_transport_error_rejects_an_unknown_kind():
+    """A typo must not silently land in the non-retryable default."""
+    with pytest.raises(ValueError, match="unknown TransportError kind"):
+        TransportError("boom", kind="transient")
+
+
+def test_transport_error_is_transient_is_read_only():
+    """The boolean was assignable before; that is what let policies diverge."""
+    err = TransportError("timed out", kind="wall_timeout")
+    with pytest.raises(AttributeError):
+        err.is_transient = True  # type: ignore[misc]
 
 
 def test_transport_unavailable_is_not_transient():

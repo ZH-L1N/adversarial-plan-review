@@ -191,6 +191,146 @@ def test_exit_below_default_ceiling_keeps_looping():
     assert decision.reason == ExitReason.NO_EXIT
 
 
+def _all_accepted_state(round_n):
+    """A round whose every finding was accepted — i.e. the plan was edited."""
+    findings = [
+        Finding("high", "cat", "breaks X", "fix X", "ev"),
+        Finding("medium", "cat", "breaks Y", "fix Y", "ev"),
+    ]
+    review = _review(status="FINDINGS_PRESENT", findings=findings)
+    decisions = [
+        PlannerDecision(f"f_r{round_n}_{i}", "accept", "good catch", "edited")
+        for i in range(1, len(findings) + 1)
+    ]
+    return _state(round_n=round_n, review=review, decisions=decisions)
+
+
+def test_ceiling_with_all_accepted_soft_blocks():
+    """A ceiling exit must not silently end the loop on an unvalidated plan.
+
+    Accepting every finding leaves zero OPEN items, so gating the soft-block
+    on `has_open` alone exited without any reviewer reading the edits the
+    accepts produced — the exact case the RESOLVED branch's accept guard
+    exists to prevent. Rare at a ceiling of 20, ordinary at 5.
+    """
+    decision = evaluate_exit(
+        _all_accepted_state(DEFAULT_MAX_ROUNDS), cumulative_cost_usd=0.5, cost_cap_usd=5.0
+    )
+    assert decision.reason == ExitReason.CEILING_HIT
+    assert decision.needs_soft_block is True
+    assert not decision.open_highs and not decision.open_mediums
+    assert decision.unvalidated_accepts == [
+        (f"f_r{DEFAULT_MAX_ROUNDS}_1", "high"),
+        (f"f_r{DEFAULT_MAX_ROUNDS}_2", "medium"),
+    ]
+
+
+def test_cost_cap_with_all_accepted_soft_blocks():
+    """The cost cap has the identical hole and is reachable well before the ceiling."""
+    decision = evaluate_exit(
+        _all_accepted_state(2), cumulative_cost_usd=6.0, cost_cap_usd=5.0
+    )
+    assert decision.reason == ExitReason.COST_CAPPED
+    assert decision.needs_soft_block is True
+    assert [sev for _, sev in decision.unvalidated_accepts] == ["high", "medium"]
+
+
+def test_planner_locked_all_rejected_needs_no_soft_block():
+    """All-rejected means no plan edits, so there is nothing to validate."""
+    findings = [Finding("medium", "cat", "breaks Y", "fix Y", "ev")]
+    review = _review(status="FINDINGS_PRESENT", findings=findings)
+    state = _state(
+        round_n=DEFAULT_MAX_ROUNDS,
+        review=review,
+        decisions=[PlannerDecision(f"f_r{DEFAULT_MAX_ROUNDS}_1", "reject", "out of scope")],
+    )
+    decision = evaluate_exit(state, cumulative_cost_usd=0.5, cost_cap_usd=5.0)
+    assert decision.reason == ExitReason.PLANNER_LOCKED
+    assert decision.needs_soft_block is False
+    assert decision.unvalidated_accepts == []
+
+
+def test_decision_naming_unknown_item_id_is_rejected():
+    """A decision on a nonexistent item would fire the gate with nothing to show.
+
+    `needs_soft_block` is derived from the enumerated accepts, so a stale or
+    typoed `item_id` must not be able to reach `evaluate_exit` — otherwise the
+    soft-block prompt appears with zero items to display or persist.
+    """
+    review = _review(status="FINDINGS_PRESENT",
+                     findings=[Finding("high", "c", "X", "fix", "ev")])
+    state = _state(round_n=3, review=review,
+                   decisions=[PlannerDecision("f_r1_1", "accept", "stale id")])
+    with pytest.raises(ValueError, match="unknown item_id"):
+        evaluate_exit(state, cumulative_cost_usd=0.5, cost_cap_usd=5.0)
+
+
+def test_duplicate_decision_for_one_item_is_rejected():
+    review = _review(status="FINDINGS_PRESENT",
+                     findings=[Finding("high", "c", "X", "fix", "ev")])
+    state = _state(
+        round_n=3,
+        review=review,
+        decisions=[
+            PlannerDecision("f_r3_1", "accept", "first"),
+            PlannerDecision("f_r3_1", "reject", "second"),
+        ],
+    )
+    with pytest.raises(ValueError, match="duplicate decision"):
+        evaluate_exit(state, cumulative_cost_usd=0.5, cost_cap_usd=5.0)
+
+
+def test_malformed_decision_is_not_buildable_into_a_sidecar():
+    """Validation must precede persistence, not follow it.
+
+    `evaluate_exit` also checks, but it runs at step 7 — by then step 6 has
+    written and rendered the sidecar, so a malformed decision would already be
+    baked into the authoritative audit record when the exception fired.
+    """
+    review = _review(status="FINDINGS_PRESENT",
+                     findings=[Finding("high", "c", "X", "fix", "ev")])
+    state = _state(round_n=3, review=review,
+                   decisions=[PlannerDecision("f_r1_1", "accept", "stale id")])
+    with pytest.raises(ValueError, match="unknown item_id"):
+        build_sidecar(state, raw_response_text="{}")
+
+
+def test_resume_rejects_a_sidecar_with_dangling_decision_ids():
+    """A sidecar written before this invariant existed must not be trusted.
+
+    JSON Schema can express shape but not "this item_id names a finding in
+    this same document", so without the semantic check a malformed historical
+    sidecar passes resume validation and is believed.
+    """
+    review = _review(status="FINDINGS_PRESENT",
+                     findings=[Finding("high", "c", "X", "fix", "ev")])
+    good = _state(round_n=1, review=review, baseline="# plan",
+                  decisions=[PlannerDecision("f_r1_1", "accept", "ok")])
+    sidecar = build_sidecar(good, raw_response_text="{}")
+    validate_sidecar(sidecar)  # precondition: the well-formed one passes
+
+    sidecar["planner_decisions"][0]["item_id"] = "f_r9_7"
+    with pytest.raises(SidecarSchemaError, match="unknown item_id"):
+        validate_sidecar(sidecar)
+
+
+def test_escalation_preserves_unvalidated_accepts():
+    """`unvalidated_accepts` has a default, so omitting it here would silently
+    empty it and the end report would lose the skipped-validation items this
+    escalation exists to record."""
+    decision = evaluate_exit(
+        _all_accepted_state(DEFAULT_MAX_ROUNDS), cumulative_cost_usd=0.5, cost_cap_usd=5.0
+    )
+    assert decision.unvalidated_accepts  # precondition
+    escalated = escalate_to_resolved_with_deferrals(
+        decision,
+        [Deferral(fid, sev, "validation skipped at exit", "accepted-at-exit")
+         for fid, sev in decision.unvalidated_accepts],
+    )
+    assert escalated.reason == ExitReason.RESOLVED_WITH_DEFERRALS
+    assert escalated.unvalidated_accepts == decision.unvalidated_accepts
+
+
 def test_exit_no_exit_sentinel_when_continuing():
     """C2: NO_EXIT is the explicit "continue to N+1" signal."""
     finding = Finding("medium", "X", "Y", "Z", "W")
@@ -215,7 +355,9 @@ def test_exit_priority_order():
     state = _state(
         round_n=20,
         review=_review(status="FINDINGS_PRESENT", findings=[finding]),
-        decisions=[PlannerDecision("f_r1_1", "reject", "no")],
+        # Must name THIS round's item: the fixture previously said "f_r1_1"
+        # against round 20, which `_validate_decision_ids` now rejects.
+        decisions=[PlannerDecision("f_r20_1", "reject", "no")],
     )
     decision = evaluate_exit(state, max_rounds=20, cumulative_cost_usd=10.0, cost_cap_usd=5.0)
     assert decision.reason == ExitReason.PLANNER_LOCKED

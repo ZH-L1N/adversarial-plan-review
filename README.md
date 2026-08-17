@@ -58,17 +58,23 @@ The reviewer subprocess is a real agent with tools, running in *your* repo. Cont
 ```
 --setting-sources ""      # no user/project settings: no inherited permission mode, hooks, or CLAUDE.md priors
 --strict-mcp-config       # no MCP servers
---tools <set>             # restrict the tool SET (default Read,Grep,Glob,Bash)
---allowedTools <set>      # pre-grant exactly that set, nothing else
+--tools Read,Grep,Glob,Bash    # the tool SET the reviewer may use at all
+--allowedTools Read,Grep,Glob  # the subset pre-granted; Bash must escalate
 --disallowedTools Write,Edit,MultiEdit,NotebookEdit,Bash(git commit*),Bash(git push*),…,Bash(rm -r*),Bash(sudo*)
 --max-turns 120 --max-budget-usd 5.0
 ```
 
-**Why a prose-only guard is not enough.** Telling the reviewer "never modify tracked files" is advisory — it is a request to a model, not a constraint on a process. It was probed directly on `claude 2.1.227`: with this machine's user-level `permissions.defaultMode: bypassPermissions` in `~/.claude/settings.json`, a `-p` child granted **only** `Read`/`Grep`/`Glob` still executed `Write` and created a file. `--allowedTools` alone does not contain, because the inherited settings out-rank it. Adding `--setting-sources ""` turned the same attempt into a `permission_denials` entry and no file on disk. `--tools Read,Grep,Glob,Bash` alone is likewise insufficient — `Bash` *is* a write primitive, which is why the `--disallowedTools` floor exists on top of it.
+**Why a prose-only guard is not enough.** Telling the reviewer "never modify tracked files" is advisory — it is a request to a model, not a constraint on a process. It was probed directly on `claude 2.1.227`: with this machine's user-level `permissions.defaultMode: bypassPermissions` in `~/.claude/settings.json`, a `-p` child granted **only** `Read`/`Grep`/`Glob` still executed `Write` and created a file. `--allowedTools` alone does not contain, because the inherited settings out-rank it. Adding `--setting-sources ""` turned the same attempt into a `permission_denials` entry and no file on disk.
+
+**Why the SET and the GRANT differ.** `Bash` is a write primitive, and the `--disallowedTools` floor can only blacklist command *prefixes* — `printf x > plans/plan.md`, `sed -i`, `python -c`, and `tee` all sail past it, so a pre-granted Bash would let the reviewer rewrite the very plan it is reviewing. Scoping the grant instead (`Bash(git log *)`) is not a fix: Anthropic's permission docs warn that Bash argument patterns are fragile, and a trailing wildcard accepts arbitrary further flags. So Bash stays in `--tools` but out of `--allowedTools`, and escalation under settings isolation is a real denial.
+
+That does **not** cost the repo-verification the transport exists for. Probed on `claude 2.1.233` in a throwaway git repo with these exact flags: `git log --oneline -1` **succeeded** (Claude Code recognizes read-only command forms and permits them in every mode), while `printf PWNED > probe_write.txt` was blocked as an output redirection — even to a path inside the working directory — and `python3 -c "open(...,'w').write(...)"` stopped at an approval that isolation never grants. Neither file existed afterwards. What is intentionally given up is arbitrary process execution: running the reviewed repo's tests or linters (they create caches and generated files), `rg --pre`, and arbitrary repo scripts. Those need a real read-only filesystem sandbox before they can honestly live here.
+
+The pre-grant is a code constant on purpose — there is no env var for it. `load_local_env()` sources `<cwd>/.env` and lets it beat the skill's own file, and cwd is the repository under review, so an overridable grant would let a reviewed repo ship a `.env` that re-grants Bash to the reviewer reading it.
 
 Settings isolation also buys independence: a one-word reply run from a repo root consumed ~37k cache tokens of ambient context (`CLAUDE.md` + skills + settings), i.e. an un-isolated child inherits the reviewed repo's own priors — exactly the self-agreement this skill exists to avoid.
 
-If you want zero write primitives, set `ADVERSARIAL_CLAUDE_TOOLS=Read,Grep,Glob`. The reviewer then verifies by reading only (no lint probes, no `git log`).
+If you want the reviewer to have no shell at all — giving up `git log` and every other recognized read-only command — set `ADVERSARIAL_CLAUDE_TOOLS=Read,Grep,Glob`. The pre-grant is intersected with the set, so narrowing the set narrows both; widening it can never widen the grant.
 
 ### Quota fallback (OpenAI → Claude)
 
@@ -167,7 +173,7 @@ All are optional except `OPENAI_API_KEY` when using the OpenAI transport.
 | `OPENAI_INPUT_USD_PER_1M` | (built-in rates) | Override input price per 1M tokens (for non-default billing tiers). `gpt*` rows only — the gate allow-lists them, so nothing else (a `claude-*` row, or a CLI alias) can be re-priced by an OpenAI contract rate |
 | `OPENAI_OUTPUT_USD_PER_1M` | (built-in rates) | Override output price per 1M tokens (`gpt*` rows only) |
 | `CLAUDE_REVIEWER_MODEL` | `opus` | Model for the Claude CLI path. A CLI alias (`opus`/`sonnet`/`fable`) or a full model id; the *resolved* id is what gets recorded and rate-keyed — from `modelUsage[*].canonicalModel` when the envelope reports it, else from the alias map |
-| `ADVERSARIAL_CLAUDE_TOOLS` | `Read,Grep,Glob,Bash` | Tool floor for the reviewer subprocess — passed to BOTH `--tools` and `--allowedTools`. Use `Read,Grep,Glob` for a read-only reviewer (drops the only write primitive) |
+| `ADVERSARIAL_CLAUDE_TOOLS` | `Read,Grep,Glob,Bash` | The tool SET (`--tools`) the reviewer subprocess may use. It can only **narrow**: the pre-grant (`--allowedTools`, a fixed `Read,Grep,Glob`) is intersected with it, so setting `Read,Grep,Glob` drops the shell entirely while adding tools here grants nothing. There is deliberately no env var for the pre-grant — see "Why the SET and the GRANT differ" above |
 | `ADVERSARIAL_CLAUDE_TIMEOUT_S` | `1200` | Wall-clock timeout for one claude round. A timeout is classified transient (one retry) |
 | `ADVERSARIAL_CLAUDE_MAX_TURNS` | `120` | `--max-turns` cap (2× the max turn count observed in the design probes). Exhausting it truncates the round → transient, one retry |
 | `ADVERSARIAL_CLAUDE_MAX_BUDGET_USD` | `5.0` | `--max-budget-usd` cap for one claude round |

@@ -75,7 +75,29 @@ CLAUDE_MODEL_ALIASES = {
 # still executed Write and created a file. `--setting-sources ""` is what turns
 # the grant into a real denial (and drops inherited hooks + the reviewed repo's
 # ambient CLAUDE.md priors, ~37k cache tokens on a one-word probe).
+#
+# `--tools` is the SET the reviewer may use at all; `--allowedTools` is the
+# subset pre-granted without asking. They are deliberately different. Bash is
+# in the set but NOT pre-granted, because a bare or wildcarded Bash grant is a
+# write primitive: the deny floor below can only blacklist prefixes, so
+# `printf x > plans/plan.md`, `sed -i`, `python -c`, and `tee` all sail past it
+# and the reviewer can rewrite the very plan it is reviewing. Scoping the grant
+# instead (`Bash(git log *)`) is not a fix either — Anthropic's permission docs
+# warn that Bash argument patterns are fragile, and a trailing wildcard accepts
+# arbitrary further flags.
+#
+# Leaving Bash ungranted is not the same as removing it. Claude Code itself
+# recognizes read-only command forms and permits them in every mode while
+# escalating anything write-capable, so the reviewer keeps `git log`,
+# `git show`, `git status`, `git diff`, `git ls-files`, `stat` and friends —
+# which is what "repo-verifying" actually needs — while escalation under
+# `--setting-sources ""` is a real denial rather than an inherited approval.
+# What is intentionally given up: arbitrary process execution, i.e. running the
+# reviewed repo's tests or linters (they create caches and generated files),
+# `rg --pre`, and arbitrary repo scripts. Those need a genuine read-only
+# filesystem sandbox before they can honestly live in this transport.
 DEFAULT_CLAUDE_TOOLS = "Read,Grep,Glob,Bash"
+DEFAULT_CLAUDE_ALLOWED_TOOLS = "Read,Grep,Glob"
 CLAUDE_DISALLOWED_TOOLS = (
     "Write,Edit,MultiEdit,NotebookEdit,"
     "Bash(git commit*),Bash(git push*),Bash(git reset*),"
@@ -117,6 +139,20 @@ _OPENAI_QUOTA_MARKERS = (
 # --- Errors ------------------------------------------------------------------
 
 
+TRANSPORT_ERROR_KINDS = (
+    "wall_timeout",  # our own --timeout tripped; a retry just doubles the wait
+    "max_turns",     # our own --max-turns guard; a second stochastic run may fit
+    "max_budget",    # our own --max-budget-usd guard; likewise
+    "api",           # rate limit, overload, network blip, malformed success
+    "permanent",     # auth failure, bad request, unknown model
+    "quota",         # account out of credit -> transport switch, never a retry
+)
+# Only these get D20's retry-once. `quota` is excluded because the answer is a
+# transport switch, and `wall_timeout` because the retry inherits the same
+# timeout: one round would burn 2 x ADVERSARIAL_CLAUDE_TIMEOUT_S before failing.
+_RETRYABLE_KINDS = frozenset({"max_turns", "max_budget", "api"})
+
+
 class TransportError(RuntimeError):
     """Reviewer transport could not complete the request.
 
@@ -124,16 +160,30 @@ class TransportError(RuntimeError):
     failed, not that the response was malformed. Callers may retry or escalate
     based on which error type they see.
 
-    `is_transient` (code-review finding I3): hint to callers whether the
-    underlying error class suggests a retryable transient (rate limit,
-    network blip, server-side overload) vs a permanent issue
-    (auth failure, malformed request). The retry-once-then-fail policy at
-    v2-plan D20 only applies to transient errors.
+    `kind` carries the retry contract. It replaced a bare `is_transient`
+    boolean, which could not express the policy the caller actually needs: a
+    1200-second wall-clock timeout and a rate limit were both "transient", yet
+    retrying the rate limit is the entire point while retrying the timeout
+    spends 40 minutes on one round before failing anyway.
     """
 
-    def __init__(self, message: str, *, is_transient: bool = False) -> None:
+    def __init__(self, message: str, *, kind: str = "permanent") -> None:
         super().__init__(message)
-        self.is_transient = is_transient
+        if kind not in TRANSPORT_ERROR_KINDS:
+            raise ValueError(
+                f"unknown TransportError kind {kind!r}; expected one of "
+                f"{TRANSPORT_ERROR_KINDS}"
+            )
+        self.kind = kind
+
+    @property
+    def is_transient(self) -> bool:
+        """Derived, read-only view of `kind` for callers that only need a yes/no.
+
+        Not settable on purpose: an independently assignable boolean is exactly
+        what let `wall_timeout` and `api` share a retry policy.
+        """
+        return self.kind in _RETRYABLE_KINDS
 
 
 class QuotaExhaustedError(TransportError):
@@ -149,7 +199,7 @@ class QuotaExhaustedError(TransportError):
     """
 
     def __init__(self, message: str) -> None:
-        super().__init__(message, is_transient=False)
+        super().__init__(message, kind="quota")
 
 
 class TransportUnavailableError(TransportError):
@@ -161,7 +211,7 @@ class TransportUnavailableError(TransportError):
     """
 
     def __init__(self, message: str) -> None:
-        super().__init__(message, is_transient=False)
+        super().__init__(message, kind="permanent")
 
 
 # --- Transport detection -----------------------------------------------------
@@ -364,7 +414,7 @@ def _invoke_openai(prompt: str, *, round_n: int, model: str | None) -> ReviewRes
         is_transient = isinstance(exc, transient_classes) if transient_classes else False
         raise TransportError(
             f"OpenAI Responses API call failed ({type(exc).__name__}): {exc}",
-            is_transient=is_transient,
+            kind="api" if is_transient else "permanent",
         ) from exc
 
     raw_text = _extract_openai_output_text(response)
@@ -476,7 +526,40 @@ def _invoke_claude(
     `permissions.defaultMode` from the child.
     """
     chosen_model = model or os.environ.get("CLAUDE_REVIEWER_MODEL", DEFAULT_CLAUDE_MODEL)
-    tools = os.environ.get("ADVERSARIAL_CLAUDE_TOOLS", DEFAULT_CLAUDE_TOOLS)
+    # Everything read from the environment here is attacker-supplied for our
+    # purposes: `load_local_env()` sources `<cwd>/.env`, lets it beat the
+    # skill's own file, and cwd is the repository under review. So the env var
+    # states a REQUEST, and both argv values below are intersections with the
+    # built-in constants — subsets, never supersets.
+    #
+    # The SET is intersected too, not only the grant. "In `--tools` but absent
+    # from `--allowedTools`" is NOT equivalent to "absent": the containment
+    # probe showed Claude Code executes ungranted commands it classifies as
+    # read-only — that is exactly how `git log` still works — so an unexpected
+    # tool smuggled into the set could run without ever appearing in the
+    # grant. There is deliberately no env var for the pre-grant at all: an
+    # overridable grant would let a reviewed repo hand a shell to the reviewer
+    # reading it, i.e. the audited subject choosing the auditor's permissions.
+    requested = {
+        t.strip()
+        for t in os.environ.get(
+            "ADVERSARIAL_CLAUDE_TOOLS", DEFAULT_CLAUDE_TOOLS
+        ).split(",")
+        if t.strip()
+    }
+    # Constant order, not request order, so argv stays deterministic.
+    tools = ",".join(t for t in DEFAULT_CLAUDE_TOOLS.split(",") if t in requested)
+    allowed_tools = ",".join(
+        t for t in DEFAULT_CLAUDE_ALLOWED_TOOLS.split(",") if t in tools.split(",")
+    )
+    if not tools:
+        # Fail closed and legibly: an empty set would otherwise reach the CLI
+        # as a bare empty argument and surface as an opaque parse error.
+        raise TransportError(
+            "ADVERSARIAL_CLAUDE_TOOLS requested no tool from the supported set "
+            f"({DEFAULT_CLAUDE_TOOLS}) — the reviewer would have no way to read "
+            "the plan."
+        )
     timeout_s = _env_int("ADVERSARIAL_CLAUDE_TIMEOUT_S", DEFAULT_CLAUDE_TIMEOUT_S)
     max_turns = _env_int("ADVERSARIAL_CLAUDE_MAX_TURNS", DEFAULT_CLAUDE_MAX_TURNS)
     # Normalised through float() so a bad value fails here — as a named
@@ -500,9 +583,10 @@ def _invoke_claude(
         # hooks, or ambient CLAUDE.md priors
         "--strict-mcp-config",  # no MCP servers
         "--tools",
-        tools,  # restrict the tool SET
+        tools,  # restrict the tool SET (Bash included)
         "--allowedTools",
-        tools,  # and pre-grant exactly it (isolated => real denials)
+        allowed_tools,  # pre-grant only the read tools; Bash must escalate,
+        # and under --setting-sources "" escalation is a real denial
         "--disallowedTools",
         CLAUDE_DISALLOWED_TOOLS,
         # NOTE: `--max-turns` is accepted and enforced on claude 2.1.227 but is
@@ -532,8 +616,9 @@ def _invoke_claude(
     except subprocess.TimeoutExpired as exc:
         raise TransportError(
             f"Claude CLI timed out after {timeout_s}s "
-            "(ADVERSARIAL_CLAUDE_TIMEOUT_S). Retry once per D20.",
-            is_transient=True,
+            "(ADVERSARIAL_CLAUDE_TIMEOUT_S). NOT retried: a retry inherits the "
+            "same timeout, so one round would cost twice the wait before failing.",
+            kind="wall_timeout",
         ) from exc
     except subprocess.CalledProcessError as exc:
         # A non-zero exit can still carry the JSON envelope on stdout (a
@@ -566,7 +651,7 @@ def _invoke_claude(
         raise TransportError(
             "Claude CLI success envelope carried no `result` text; "
             "cannot parse reviewer JSON",
-            is_transient=True,
+            kind="api",
         )
 
     resolved_model = _resolve_claude_model_id(envelope, fallback=chosen_model)
@@ -633,21 +718,21 @@ def _raise_on_claude_error_envelope(
         raise TransportError(
             f"Claude review truncated by our own guard: --max-turns {max_turns} "
             "exhausted (raise ADVERSARIAL_CLAUDE_MAX_TURNS if this repeats).",
-            is_transient=True,
+            kind="max_turns",
         )
     detail = str(envelope.get("terminal_reason") or "").strip()
     if "budget" in subtype or "budget" in detail.lower():
         raise TransportError(
             f"Claude review truncated by our own guard: --max-budget-usd {max_budget} "
             "exhausted (raise ADVERSARIAL_CLAUDE_MAX_BUDGET_USD if this repeats).",
-            is_transient=True,
+            kind="max_budget",
         )
 
     lowered = f"{subtype} {detail}".lower()
     raise TransportError(
         f"Claude CLI returned an error envelope (subtype={subtype or 'unknown'!r}): "
         f"{detail or '(no terminal_reason reported)'}",
-        is_transient=any(marker in lowered for marker in _CLAUDE_TRANSIENT_MARKERS),
+        kind="api" if any(m in lowered for m in _CLAUDE_TRANSIENT_MARKERS) else "permanent",
     )
 
 
